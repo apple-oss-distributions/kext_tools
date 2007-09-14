@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -20,27 +20,11 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#ifndef __PTLOCK_H__
-#define __PTLOCK_H__
+#ifndef __MKEXT_UTIL_H__
+#define __MKEXT_UTIL_H__
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-    
-#include <CoreFoundation/CFBase.h>
-#include <pthread.h>
+#include <Kernel/libsa/mkext.h> 
 
-typedef struct __PTLock * PTLockRef;
+#define ISMKEXT(magic)  ((magic) == OSSwapHostToBigInt32(MKEXT_MAGIC))
 
-PTLockRef  PTLockCreate(void);
-void       PTLockFree(PTLockRef lock);
-
-Boolean    PTLockTryLock(PTLockRef lock);
-void       PTLockTakeLock(PTLockRef lock);
-void       PTLockUnlock(PTLockRef lock);
-
-#ifdef __cplusplus
-}
-#endif
-#endif __PTLOCK_H__
-
+#endif /* __MKEXT_UTIL_H__ */

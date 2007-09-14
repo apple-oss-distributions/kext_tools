@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -20,27 +20,24 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#ifndef __PTLOCK_H__
-#define __PTLOCK_H__
+/*
+ * 
+ * FILE: watchvol.h
+ * AUTH: Soren Spies (sspies)
+ * DATE: 6 March 2006
+ * DESC: header for volume watching routines
+ *
+ * $NoLog$
+ */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-    
-#include <CoreFoundation/CFBase.h>
-#include <pthread.h>
+// for kextd_main
+int kextd_watch_volumes(int sourcePriority/*, CFRunLoopRef runloop*/);
+int kextd_giveup_volwatch();
+void kextd_stop_volwatch();
 
-typedef struct __PTLock * PTLockRef;
-
-PTLockRef  PTLockCreate(void);
-void       PTLockFree(PTLockRef lock);
-
-Boolean    PTLockTryLock(PTLockRef lock);
-void       PTLockTakeLock(PTLockRef lock);
-void       PTLockUnlock(PTLockRef lock);
-
-#ifdef __cplusplus
-}
-#endif
-#endif __PTLOCK_H__
-
+void updateRAIDSet(
+    CFNotificationCenterRef center,
+    void * observer,
+    CFStringRef name,
+    const void * object,
+    CFDictionaryRef userInfo);

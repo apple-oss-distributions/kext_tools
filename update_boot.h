@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -20,27 +20,26 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#ifndef __PTLOCK_H__
-#define __PTLOCK_H__
+/*
+ * FILE: update_boot.h
+ * AUTH: Soren Spies (sspies)
+ * DATE: 8 June 2006
+ * DESC: routines for implementing 'kextcache -u' functionality (4252674)
+ *	 in which bootcaches.plist files get copied to any Apple_Boots
+ */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-    
-#include <CoreFoundation/CFBase.h>
-#include <pthread.h>
+#include <sys/types.h>	    // mode_t
 
-typedef struct __PTLock * PTLockRef;
 
-PTLockRef  PTLockCreate(void);
-void       PTLockFree(PTLockRef lock);
+// in update_boot.c (for kextcache_main.c)
 
-Boolean    PTLockTryLock(PTLockRef lock);
-void       PTLockTakeLock(PTLockRef lock);
-void       PTLockUnlock(PTLockRef lock);
+// additional RPS files (e.g. from the command-line?) currently unused
+int updateBoots(char *volRoot, int extraRPSc, const char *extraRPS[],
+		Boolean force, Boolean expectUpToDate);
 
-#ifdef __cplusplus
-}
-#endif
-#endif __PTLOCK_H__
 
+// in kextcache_main.c (for update_boot.c)
+
+// "put" and "take" let routines decide if a lock is needed (e.g. if no kextd)
+int takeVolumeForPaths(char *volPath, int filec, const char *files[]);
+int putVolumeForPath(const char *path, int status);
