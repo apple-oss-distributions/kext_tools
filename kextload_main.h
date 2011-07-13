@@ -116,4 +116,4 @@ ExitStatus exitStatusForOSReturn(OSReturn osReturn);
 
 static void usage(UsageLevel usageLevel);
 
-#endif /* _KEXTLOAD_MAIN_H */
+#endif

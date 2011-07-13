@@ -138,7 +138,8 @@ readArgs(
     char * const * argv,
     KextloadArgs * toolArgs)
 {
-    ExitStatus   result = EX_USAGE;
+    ExitStatus   result          = EX_USAGE;
+    ExitStatus   scratchResult   = EX_USAGE;
     int          optchar;
     int          longindex;
     CFStringRef  scratchString   = NULL;  // must release
@@ -207,7 +208,11 @@ readArgs(
                 break;
 
             case kOptVerbose:
-                result = setLogFilterForOpt(argc, argv, /* forceOnFlags */ 0);
+                scratchResult = setLogFilterForOpt(argc, argv, /* forceOnFlags */ 0);
+                if (scratchResult != EX_OK) {
+                    result = scratchResult;
+                    goto finish;
+                }
                 break;
 
             case kOptNoCaches:
@@ -255,7 +260,7 @@ readArgs(
    /*****
     * Record the kext names from the command line.
     */
-    for (i = optind; i < argc; i++) {
+    for (i = optind; (int)i < argc; i++) {
         SAFE_RELEASE_NULL(scratchURL);
         scratchURL = CFURLCreateFromFileSystemRepresentation(
             kCFAllocatorDefault,
@@ -348,15 +353,15 @@ ExitStatus checkAccess(void)
         goto finish;
     }
     
-#endif /* !TARGET_OS_EMBEDDED */
+#endif
 
 finish:
     
 #if !TARGET_OS_EMBEDDED
     if (kextd_port != MACH_PORT_NULL) {
-        mach_port_destroy(mach_task_self(), kextd_port);
+        mach_port_deallocate(mach_task_self(), kextd_port);
     }
-#endif /* !TARGET_OS_EMBEDDED */
+#endif
 
     return result;
 }
