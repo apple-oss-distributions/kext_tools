@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -96,7 +96,7 @@ KextdArgs                 sToolArgs;
 CFArrayRef                gRepositoryURLs         = NULL;
 static CFArrayRef         sAllKexts               = NULL;
 
-Boolean                   gKernelRequestsPending = false;
+Boolean                   gKernelRequestsPending            = false;
 
 // all the following are released in setUpServer()
 static CFRunLoopTimerRef  sReleaseKextsTimer                = NULL;
@@ -108,6 +108,48 @@ static CFRunLoopSourceRef sSignalRunLoopSource              = NULL;
 const NXArchInfo        * gKernelArchInfo                   = NULL;  // do not free
 
 ExitStatus                sKextdExitStatus                  = kKextdExitOK;
+
+/*******************************************************************************
+ * Static routines.
+ ******************************************************************************/
+static void NoLoadSigFailureKextCallback(
+                                         CFNotificationCenterRef center,
+                                         void *observer,
+                                         CFStringRef name,
+                                         const void *object,
+                                         CFDictionaryRef userInfo );
+static void InvalidSignedKextCallback(
+                                      CFNotificationCenterRef center,
+                                      void *observer,
+                                      CFStringRef name,
+                                      const void *object,
+                                      CFDictionaryRef userInfo );
+static void RevokedCertKextCallback(
+                                    CFNotificationCenterRef center,
+                                    void *observer,
+                                    CFStringRef name,
+                                    const void *object,
+                                    CFDictionaryRef userInfo );
+#if 0 // not yet
+static void UnsignedKextCallback(
+                                 CFNotificationCenterRef center,
+                                 void *observer,
+                                 CFStringRef name,
+                                 const void *object,
+                                 CFDictionaryRef userInfo );
+#endif
+static void ExcludedKextCallback(
+                                 CFNotificationCenterRef center,
+                                 void *observer,
+                                 CFStringRef name,
+                                 const void *object,
+                                 CFDictionaryRef userInfo );
+static void LoadedKextCallback(
+                               CFNotificationCenterRef center,
+                               void *observer,
+                               CFStringRef name,
+                               const void *object,
+                               CFDictionaryRef userInfo );
 
 /*******************************************************************************
 *******************************************************************************/
@@ -178,23 +220,10 @@ int main(int argc, char * const * argv)
         OSKextSetSimulatedSafeBoot(true);
     }
 
-   /* safeBootMode may have been set from cmd line, check apart from the OSKext
-    * call. If safeboot, invalidate caches so they will be rebuilt
-    * (if not in near future, at next reboot).
-    */
-    if (sToolArgs.safeBootMode) {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogWarningLevel | kOSKextLogGeneralFlag | kOSKextLogLoadFlag,
-            "Safe boot mode detected; invalidating system extensions caches.");
-        utimes("/System/Library/Extensions", NULL);
-    }
-
     OSKextSetUsesCaches(sToolArgs.useRepositoryCaches);
 
     OSKextSetRecordsDiagnostics(kOSKextDiagnosticsFlagNone);
     readExtensions();
-
-// server_start:    // unneeded?
 
     sKextdExitStatus = setUpServer(&sToolArgs);
     if (sKextdExitStatus != EX_OK) {
@@ -487,7 +516,7 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
     if (kextd_watch_volumes(sourcePriority++)) {
         goto finish;
     }
-
+    
     sKextdSignalMachPort = CFMachPortCreate(kCFAllocatorDefault,
         handleSignalInRunloop, NULL, NULL);
     if (!sKextdSignalMachPort) {
@@ -536,6 +565,12 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
    CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
        NULL, // const void *observer
        updateCoreStorageVolume,
+       CFSTR(kCoreStorageNotificationLVGChanged),
+       NULL, // const void *object
+       CFNotificationSuspensionBehaviorHold);
+   CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
+       NULL, // const void *observer
+       updateCoreStorageVolume,
        CFSTR(kCoreStorageNotificationVolumeChanged),
        NULL, // const void *object
        CFNotificationSuspensionBehaviorHold);
@@ -544,6 +579,69 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
        OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
            "Failed to register for CoreStorage Volume notifications.");
    }
+
+    /* Sign up to receive notifications when nonsigned kexts are found.  We
+     * currently get messages from kextcache, kextload and kextutil.
+     */
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(),
+                                    NULL,
+                                    NoLoadSigFailureKextCallback,
+                                    CFSTR("No Load Kext Notification"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    /* Sign up to receive notifications when invalid signed kexts are found.  We
+     * currently get messages from kextcache, kextload and kextutil.
+     */
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(),
+                                    NULL,
+                                    InvalidSignedKextCallback,
+                                    CFSTR("Invalid Signature Kext Notification"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    /* Sign up to receive notifications when kexts are found on the exclude
+     * list.  We currently get messages from kextcache, kextload and kextutil.
+     */
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(),
+                                    NULL,
+                                    ExcludedKextCallback,
+                                    CFSTR("Excluded Kext Notification"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    /* Sign up to receive notifications when kexts with revoked certs are
+     * found.  We currently get messages from kextcache, kextload and kextutil.
+     */
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(),
+                                    NULL,
+                                    RevokedCertKextCallback,
+                                    CFSTR("Revoked Cert Kext Notification"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+
+#if 0 // not yet
+   /* Sign up to receive notifications when unisgned kexts are found.  We
+     * currently get messages from kextcache, kextload and kextutil.
+     */
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(),
+                                    NULL,
+                                    UnsignedKextCallback,
+                                    CFSTR("Unsigned Kext Notification"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);    
+#endif
+
+    /* Sign up to receive notifications when kexts are loaded.
+     * We currently get messages from kextcache, kextload and kextutil.
+     */
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(),
+                                    NULL,
+                                    LoadedKextCallback,
+                                    CFSTR("Loaded Kext Notification"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+
 
 #ifndef NO_CFUserNotification
     result = startMonitoringConsoleUser(toolArgs, &sourcePriority);
@@ -565,6 +663,141 @@ finish:
     SAFE_RELEASE(kextdMachPort);
 
     return result;
+}
+
+#include "security.h"
+
+/******************************************************************************
+ * NoLoadSigFailureKextCallback() CFNotificationCenter posts from kextcache,
+ * kextload and kextutil enter here.
+ ******************************************************************************/
+void NoLoadSigFailureKextCallback(CFNotificationCenterRef center,
+                                  void *observer,
+                                  CFStringRef name,
+                                  const void *object,
+                                  CFDictionaryRef userInfo)
+{
+    if (userInfo) {
+        /* synchronize access to our plist file */
+        CFRetain(userInfo);
+        dispatch_async(dispatch_get_main_queue(), ^ {
+            writeKextAlertPlist(userInfo, NO_LOAD_KEXT_ALERT);
+        });
+    }
+    
+    return;
+}
+
+/******************************************************************************
+ * RevokedCertKextCallback() CFNotificationCenter posts from kextcache,
+ * kextload and kextutil enter here.
+ ******************************************************************************/
+void RevokedCertKextCallback(CFNotificationCenterRef center,
+                             void *observer,
+                             CFStringRef name,
+                             const void *object,
+                             CFDictionaryRef userInfo)
+{
+    if (userInfo) {
+        /* synchronize access to our plist file */
+        CFRetain(userInfo);
+        dispatch_async(dispatch_get_main_queue(), ^ {
+            sendRevokedCertAlert(userInfo);
+        });
+    }
+    
+    return;
+}
+
+#if 0 // not yet
+/******************************************************************************
+ * UnsignedKextCallback() CFNotificationCenter posts from kextcache,
+ * kextload and kextutil enter here.
+ ******************************************************************************/
+void UnsignedKextCallback(CFNotificationCenterRef center,
+                          void *observer,
+                          CFStringRef name,
+                          const void *object,
+                          CFDictionaryRef userInfo)
+{
+    if (userInfo) {
+        /* synchronize access to our plist file */
+        CFRetain(userInfo);
+        dispatch_async(dispatch_get_main_queue(), ^ {
+            writeKextAlertPlist(userInfo, UNSIGNED_KEXT_ALERT);
+        });
+    }
+    
+    return;
+}
+#endif
+
+/******************************************************************************
+ * InvalidSignedKextCallback() CFNotificationCenter posts from kextcache,
+ * kextload and kextutil enter here.
+ ******************************************************************************/
+void InvalidSignedKextCallback(CFNotificationCenterRef center,
+                               void *observer,
+                               CFStringRef name,
+                               const void *object,
+                               CFDictionaryRef userInfo)
+{
+    if (userInfo) {
+        /* synchronize access to our plist file */
+        CFRetain(userInfo);
+        dispatch_async(dispatch_get_main_queue(), ^ {
+            writeKextAlertPlist(userInfo, INVALID_SIGNATURE_KEXT_ALERT);
+        });
+    }
+    
+    return;
+}
+
+/******************************************************************************
+ * ExcludedKextCallback() CFNotificationCenter posts from kextcache, kextload
+ * and kextutil enter here.
+ ******************************************************************************/
+void ExcludedKextCallback(CFNotificationCenterRef center,
+                          void *observer,
+                          CFStringRef name,
+                          const void *object,
+                          CFDictionaryRef userInfo)
+{
+   if (userInfo) {
+        /* synchronize access to our plist file */
+        CFRetain(userInfo);
+        dispatch_async(dispatch_get_main_queue(), ^ {
+            writeKextAlertPlist(userInfo, EXCLUDED_KEXT_ALERT);
+        });
+    }
+    
+    return;
+}
+
+/******************************************************************************
+ * LoadedKextCallback() CFNotificationCenter posts from kextcache, kextload
+ * and kextutil enter here.  Used for message tracing of kext loads.
+ ******************************************************************************/
+void LoadedKextCallback(CFNotificationCenterRef center,
+                          void *observer,
+                          CFStringRef name,
+                          const void *object,
+                          CFDictionaryRef userInfo)
+{
+   if (userInfo) {
+        CFArrayRef myValue;
+        myValue = CFDictionaryGetValue(userInfo, CFSTR("KextArrayKey"));
+       
+       if (myValue && CFGetTypeID(myValue) == CFArrayGetTypeID()) {
+           /* synchronize access to our plist file */
+           CFRetain(myValue);
+           dispatch_async(dispatch_get_main_queue(), ^ {
+               writeKextLoadPlist(myValue);
+           });
+       }
+    }
+    
+    return;
 }
 
 /******************************************************************************
@@ -685,47 +918,45 @@ void handleSignalInRunloop(
 }
 
 /*******************************************************************************
-* This function reads the extensions if necessary; that is, if the extensions
-* folder looks like it's changed, or if we don' thave the extensions read in
-* memory already.
-*
-* This function does not update personalities in the kernel or update any
-* caches other than those the OSKext library updates in the course of reading
-* the extensions. We have a notify thread on the extensions folder that does
-* that anyhow, with a slight delay.
-*******************************************************************************/
+ * This function reads the extensions if necessary.  Note support for multiple
+ * extensions directories.
+ *
+ * This function does not update personalities in the kernel or update any
+ * caches other than those the OSKext library updates in the course of reading
+ * the extensions. We have a notify thread on the extensions folders that does
+ * that, with a slight delay.
+ *******************************************************************************/
 void readExtensions(void)
 {
-    static Boolean         haveStattedExtensions = false;
-    static struct timespec lastTimespec;
-    struct stat            statBuf;
-    Boolean                needReread            = false;
+    static struct timeval   lastModTime = {0,0};
+    static struct timeval   lastAccessTime = {0,0};
+    struct timeval          tempTimes[2];
+    ExitStatus              result = EX_SOFTWARE;
 
-   /* If we fail to stat the extensions folder, note need to reread.
-    * If it succeeds, and we have an old timespec and the new one differs,
-    * note need to reread.
+   /* If getLatestTimesFromCFURLArray fails for any of the extensions
+    * directories we will force reading in all the kexts.  Otherwise we only
+    * read in all the kexts if any of the extensions directories have been
+    * modified.  The first time we're called we will save off the latest mod
+    * time and reread (which is fine since we have not read in any kexts yet).
     */
-    if (0 != stat(kSystemExtensionsDir, &statBuf)) {
-        needReread = true;
+    result = getLatestTimesFromCFURLArray(gRepositoryURLs,
+                                          tempTimes);
+    if (result != EX_OK) {
         OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-            "Failed to stat extensions folder (%s); rereading.",
-            strerror(errno));
-    } else {
-        if (!haveStattedExtensions) {
-            haveStattedExtensions = true;
-        } else if ((lastTimespec.tv_sec != statBuf.st_mtimespec.tv_sec) ||
-            (lastTimespec.tv_nsec != statBuf.st_mtimespec.tv_nsec)) {
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "Failed to stat extensions folders (%s); rereading.",
+                  strerror(errno));
 
-            needReread = true;
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogProgressLevel | kOSKextLogGeneralFlag,
-                "Extensions folder mod time has changed; rereading.");
-        }
-        lastTimespec = statBuf.st_mtimespec;
+        /* force reading all extensions */
+        releaseExtensions(/* timer */ NULL, /* context */ NULL);
     }
     
-    if (needReread) {
+    if (result == EX_OK && timercmp(&lastModTime, &tempTimes[1], !=)) {
+        lastAccessTime.tv_sec = tempTimes[0].tv_sec;
+        lastAccessTime.tv_usec = tempTimes[0].tv_usec;
+        lastModTime.tv_sec = tempTimes[1].tv_sec;
+        lastModTime.tv_usec = tempTimes[1].tv_usec;
+
         releaseExtensions(/* timer */ NULL, /* context */ NULL);
     }
 
@@ -767,6 +998,26 @@ finish:
 }
 
 /*******************************************************************************
+* If safe boot, invalidate caches (up to once / kextd invocation)
+* so they will be rebuilt, either soon or shortly after next reboot.
+*******************************************************************************/
+void checkSafeBootInvalidateCachesOnce()
+{
+    static Boolean checkedSafeBoot = false;
+
+    if (checkedSafeBoot)    return;
+
+    if (sToolArgs.safeBootMode) {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogWarningLevel | kOSKextLogGeneralFlag | kOSKextLogLoadFlag,
+            "Safe boot mode detected; invalidating system extensions caches.");
+        utimes("/System/Library/Extensions", NULL);
+    }
+
+    checkedSafeBoot = true;
+}
+
+/*******************************************************************************
 *******************************************************************************/
 void releaseExtensions(
     CFRunLoopTimerRef   timer,
@@ -780,6 +1031,10 @@ void releaseExtensions(
         SAFE_RELEASE_NULL(sReleaseKextsTimer);
     }
     SAFE_RELEASE_NULL(sAllKexts);
+
+    // and now that we've dropped whatever we booted with, perhaps invalidate
+    checkSafeBootInvalidateCachesOnce();
+
     return;
 }
 

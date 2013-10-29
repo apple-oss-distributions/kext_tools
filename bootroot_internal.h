@@ -28,29 +28,38 @@
  *       in which bootcaches.plist files get copied to any Apple_Boots
  */
 
-#include <sys/types.h>      // mode_t
+#ifndef _BOOTROOT_INTERNAL_H_
+#define _BOOTROOT_INTERNAL_H_
+
 #include <CoreFoundation/CoreFoundation.h>
 
 #include "bootroot.h"
 
-// in update_boot.c
+// internal options for "update" operations (BROptsNone #def'd in bootroot.h)
+typedef enum {
+    // this first one is orthogonal to the others :P
+    kBRUForceUpdateHelpers = 0x1,   // ignore bootstamps, update helpers
 
-typedef uint32_t updateOpts_t;
-#define kForceUpdateHelpers 0x1     // helper partitions MUST be updated
-#define kCachesOnly         0x2     // do NOT update helper partitions
-#define kHelpersOptional    0x4     // ignore helper update failures
-#define kExpectUpToDate     0x8     // successful updates -> EX_OSFILE
+    kBRUCachesOnly         = 0x2,   // only update caches, not helpers
+    kBRUHelpersOptional    = 0x4,   // ignore helper update failures
+    kBRUExpectUpToDate     = 0x8,   // successful updates -> EX_OSFILE
+
+    // kBRAnyBootStamps #def'd to 0x10000 in bootroot.h
+} BRUpdateOpts_t;
+
+
+// in update_boot.c
 
 /*
  * Update all caches and any helper partitions (kextcache -u).
  * Except when kForceUpdateHelpers is specified, unrecognized
  * bootcaches.plist causes immediate success.
  */
-int checkUpdateCachesAndBoots(
-    CFURLRef volumeURL,
-    updateOpts_t flags);
+int checkUpdateCachesAndBoots(CFURLRef volumeURL, BRUpdateOpts_t flags);
 
 // "put" and "take" let routines decide if a lock is needed (e.g. if no kextd)
 // only used by volume lockers (kextcache, libBootRoot clients, !kextd)
 int takeVolumeForPath(const char *volPath);
 int putVolumeForPath(const char *path, int status);
+
+#endif  // _BOOTROOT_INTERNAL_H_
