@@ -12,7 +12,7 @@
 #include <IOKit/kext/OSKext.h>
 #include <mach/mach_error.h>
 
-//  <rdar://problem/12435992> Message tracing for kext loads
+//  <rdar://problem/12435992>
 #include <asl.h>
 #include <Security/SecCode.h>
 #include <Security/SecCodeSigner.h>
@@ -20,7 +20,6 @@
 #include <Security/SecRequirement.h>
 #include <Security/SecRequirementPriv.h>
 #include <Security/SecCodePriv.h>
-#include <Security/cssmerr.h>
 
 #define kMessageTracerDomainKey     "com.apple.message.domain"
 #define kMessageTracerHashKey       "com.apple.message.hash"
@@ -59,9 +58,15 @@ void    messageTraceExcludedKext(OSKextRef aKext);
 void    recordKextLoadListForMT(CFArrayRef kextList);
 void    recordKextLoadForMT(OSKextRef aKext);
 
-Boolean isDebugSetInBootargs(void);
-OSStatus checkKextSignature(OSKextRef aKext, Boolean checkExceptionList);
-Boolean isInExceptionList(OSKextRef aKext, Boolean useCache);
+OSStatus checkKextSignature(OSKextRef aKext,
+                            Boolean checkExceptionList,
+                            Boolean earlyBoot);
+Boolean isInExceptionList(OSKextRef theKext, CFURLRef theKextURL, Boolean useCache);
 Boolean isInLibraryExtensionsFolder(OSKextRef theKext);
+Boolean isInSystemLibraryExtensionsFolder(OSKextRef theKext);
+Boolean isDevMode(void);
+Boolean isInvalidSignatureAllowed(void);
+Boolean isKextdRunning(void);
+int callSecKeychainMDSInstall( void );
 
 #endif // _SECURITY_H
