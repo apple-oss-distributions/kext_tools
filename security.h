@@ -65,12 +65,25 @@ OSStatus checkSignaturesOfDependents(OSKextRef theKext,
                                      Boolean checkExceptionList,
                                      Boolean earlyBoot);
 Boolean isInExceptionList(OSKextRef theKext, CFURLRef theKextURL, Boolean useCache);
+Boolean isInStrictExceptionList(OSKextRef theKext, CFURLRef theKextURL, Boolean useCache);
 Boolean isInLibraryExtensionsFolder(OSKextRef theKext);
 Boolean isInSystemLibraryExtensionsFolder(OSKextRef theKext);
-//Boolean isDevMode(void);
 Boolean isPrelinkedKernelAutoRebuildDisabled(void);
 Boolean isInvalidSignatureAllowed(void);
 Boolean isKextdRunning(void);
 int callSecKeychainMDSInstall( void );
+
+
+#if !TARGET_OS_EMBEDDED
+#define HAVE_DANGERZONE 1
+#else // !TARGET_OS_EMBEDDED
+#define HAVE_DANGERZONE 0
+#endif // !TARGET_OS_EMBEDDED
+
+void dzRecordKextLoadUser(OSKextRef kext);
+void dzRecordKextLoadKernel(OSKextRef kext);
+void dzRecordKextLoadBypass(OSKextRef kext);
+void dzRecordKextCacheAdd(OSKextRef kext);
+Boolean dzAllowKextLoad(OSKextRef kext);
 
 #endif // _SECURITY_H
