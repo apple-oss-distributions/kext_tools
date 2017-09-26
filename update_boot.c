@@ -42,6 +42,7 @@
 #include <sys/mount.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include <apfs/apfs_fsctl.h>
 
 #include <IOKit/kext/kextmanager_types.h>
 #include <IOKit/kext/OSKextPrivate.h>
@@ -89,7 +90,7 @@ enum bootReversions {
 enum blessIndices {
     kSystemFolderIdx = 0,
     kEFIBooterIdx = 1
-    // sBLSetBootFinderInfo() preserves other values
+    // sBLSetBootInfo() preserves other values
 };
 
 const char * bootReversionsStrings[] = {
@@ -124,6 +125,7 @@ struct updatingVol {
     Boolean doSanitize, cleanOnceDir;   // how to cleanse each helper
     Boolean customSource, customDest;   // vs. default B!=R setup
     Boolean useOnceDir;                 // copy to com.apple.boot.once
+    Boolean useStagingDir;              // use staging directory for copy
 
     // updated as each Apple_Boot is updated
     int bootIdx;                        // which helper are we updating
@@ -137,7 +139,6 @@ struct updatingVol {
     Boolean onAPM;                      // tweak support based on pmap
     Boolean detectedRecovery;           // seen com.apple.recovery.boot?
 };
-
 
 /******************************************************************************
 * Definitions
@@ -557,15 +558,17 @@ updateBootHelpers(struct updatingVol *up)
                 goto bootfail;
             }
         }
-        
-        if (up->doBooters && (result = ucopyBooters(up))) {                
+
+        if (up->doBooters && (result = ucopyBooters(up))) {
             goto bootfail;      // .old still active
         }
-        // If Recovery OS was available, we could swap these two and leave
-        // the Recovery OS blessed until RPS and new booters were activated.
+        // If we blessed the Recovery OS in ucopyRPS(), there's likely only
+        // one RPS dir, the new one, and this activateBooters() is the
+        // last step before the final F_FULLFSYNC in activateRPS().
         if (up->doBooters && (result = activateBooters(up))) { // committed
             goto bootfail;
         }
+
         // 10.x.n+1 booters remain compatible 10.x.n kernels?? (power outage!)
         if (up->doRPS && (result = activateRPS(up))) {         // complete
             goto bootfail;
@@ -646,6 +649,7 @@ checkRebuildAllCaches(struct bootCaches *caches,
                       int oodLogSpec,
                       Boolean invalidateKextCache,
                       Boolean earlyBootCheckUpdate,
+                      Boolean startupKextsOk,
                       Boolean *anyUpdates)
 {
     int opres, result = ELAST + 1;  // no pathc() [yet]
@@ -693,10 +697,10 @@ checkRebuildAllCaches(struct bootCaches *caches,
         OSKextLog(nil, oodLogSpec, "rebuilding %s%s",
                   caches->root ? caches->root : "/",
                   caches->kext_boot_cache_file->rpath);
-        if ((opres = rebuild_kext_boot_cache_file(
-                                                  caches, true /*wait*/,
+        if ((opres = rebuild_kext_boot_cache_file(caches,
                                                   caches->kext_boot_cache_file->rpath,
-                                                  caches->kernelpath))) {
+                                                  caches->kernelpath,
+                                                  startupKextsOk))) {
             OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
                       "Error %d rebuilding %s", result,
                       caches->kext_boot_cache_file->rpath);
@@ -731,9 +735,9 @@ checkRebuildAllCaches(struct bootCaches *caches,
                 if (invalidateKextCache ||
                     check_kext_boot_cache_file(caches, cp->rpath, tmpKernelPath)) {
                     if ((opres = rebuild_kext_boot_cache_file(caches,
-                                                              true /*wait*/,
                                                               cp->rpath,
-                                                              tmpKernelPath))) {
+                                                              tmpKernelPath,
+                                                              startupKextsOk))){
                         result = opres; goto finish;
                     }
                 }
@@ -857,6 +861,9 @@ initContext(struct updatingVol *up, CFURLRef srcVol, CFStringRef helperBSDName,
     if (helperBSDName) {
         up->boots = CFArrayCreate(nil,values,BOOTCOUNT,&kCFTypeArrayCallBacks);
     }
+
+    // if specified, use the BR-owned staging directory.
+    up->useStagingDir = (opts & kBRUseStagingDir) != 0;
 
     result = 0;
 
@@ -1049,13 +1056,14 @@ checkUpdateCachesAndBoots(CFURLRef volumeURL, BRUpdateOpts_t opts)
 {
     int opres, result = ELAST + 1;          // try to always set on error
     OSKextLogSpec oodLogSpec = kOSKextLogGeneralFlag | kOSKextLogBasicLevel;
-    Boolean earlyBootCheckUpdate;           // used in several places
-    Boolean anyCacheUpdates = false;
+    Boolean earlyBootCheckUpdate;           // derived from opts
+    Boolean anyCacheUpdates = false;        // so -U can reboot w/o helpers
     Boolean doAny = false, cachesUpToDate = false, doMisc;
     Boolean loggedOOD = false;
     struct updatingVol up = { /*NULL...*/ };
     up.curbootfd = -1;
 
+    // arguably this (and BRCopyBootFilesToDir()) could just check '-Boot'
     earlyBootCheckUpdate = ((opts & kBRUExpectUpToDate) && (opts & kBRUEarlyBoot));
     
     // try to configure 'up'; treat missing data per opts
@@ -1095,6 +1103,7 @@ checkUpdateCachesAndBoots(CFURLRef volumeURL, BRUpdateOpts_t opts)
     if ((opres = checkRebuildAllCaches(up.caches, oodLogSpec,
                                        (opts & kBRUInvalidateKextcache),
                                        earlyBootCheckUpdate,
+                                       true /* -all-loaded okay */,
                                        &anyCacheUpdates))) {
         result = opres; goto finish;    // error logged by function
     }
@@ -1189,7 +1198,23 @@ checkUpdateCachesAndBoots(CFURLRef volumeURL, BRUpdateOpts_t opts)
 
     // request actual helper updates
     if ((opres = updateBootHelpers(&up))) {
-        result = opres; goto finish;        // error logged by function
+        // if we hit ENOSPC for the current root volume, try a smaller cache
+        if (opres == ENOSPC && strcmp(up.caches->root, "/") == 0) {
+            OSKextLog(NULL, kOSKextLogWarningLevel,
+                      "Out of space in helper for '/', trying w/o -all-loaded");
+            if ((opres = checkRebuildAllCaches(up.caches, oodLogSpec,
+                                               true /* invalidate cache */,
+                                               earlyBootCheckUpdate,
+                                               false /* no -all-loaded */,
+                                               &anyCacheUpdates))) {
+                result = opres; goto finish;    // error logged by function
+            }
+            // and try updating helpers again
+            opres = updateBootHelpers(&up);
+        }
+        if (opres) {
+            result = opres; goto finish;        // error logged by function
+        }
     }
 
     if ((opres = updateStamps(up.caches, kBCStampsApplyTimes))) {
@@ -1206,8 +1231,6 @@ doneUpdatingHelpers:
     // from "successfully updated:" the latter exits with EX_OSFILE.  During
     // early boot, there is a restricted set of caches that must be updated.
     // In that case, the exit(EX_OSFILE) informs launchd to force a reboot.
-    // FIXME: anyCacheUpdates is redundant: caches are all part of up.doRPS
-    // so any cache update should cause doAny to be true.
     if ((opts & kBRUExpectUpToDate) && (anyCacheUpdates || doAny)) {
         if (earlyBootCheckUpdate) {
             OSKextLog(NULL, oodLogSpec, "%s updated critical boot files, "
@@ -1268,6 +1291,13 @@ addHostVolInfo(struct updatingVol *up, CFURLRef hostVol,
     up->flatTarget[0] = '\0';
 
     // extract any caller-specified target directory
+    if (targetStr && up->useStagingDir) {
+        // A destination path was provided with the useStagingDir flag.
+        // Since the staging directory has a fixed path,
+        // this is an invalid set of options.
+        result = EINVAL; goto finish;
+    }
+
     if (targetStr) {
         char targetdir[PATH_MAX] = "", *slash;
         if (!CFURLGetFileSystemRepresentation(targetStr, true /*resolve*/,
@@ -1285,7 +1315,7 @@ addHostVolInfo(struct updatingVol *up, CFURLRef hostVol,
         }
         pathcat(up->flatTarget, targetdir);
     }
- 
+
     // get UUIDs
     if (!CFURLGetFileSystemRepresentation(hostVol, true /*resolve base*/,
             (UInt8*)hostroot, PATH_MAX)) {
@@ -1384,7 +1414,7 @@ BRCopyBootFilesToDir(CFURLRef srcVol,
     // Detect non-default destination or source
     up.blessSpec = blessSpec;
     up.useOnceDir = ((blessSpec & kBRBlessOnce) &&
-                     (blessSpec & kBRBlessFSDefault) == 0);
+                     (blessSpec & kBRBlessFSDefault) == 0) || (up.useStagingDir);
     if (up.useOnceDir || targetDir) {
         // A) a custom destination won't interact w/default
         up.customDest = true;
@@ -1418,6 +1448,7 @@ BRCopyBootFilesToDir(CFURLRef srcVol,
     errnum = checkRebuildAllCaches(up.caches, kBRCheckLogSpec, 
                                    (opts & kBRUInvalidateKextcache),
                    (opts & kBRUExpectUpToDate) && (opts & kBRUEarlyBoot),
+                                   true, /* -all-loaded okay */
                                    NULL);
     if (errnum) {
         result = errnum; goto finish;
@@ -1439,7 +1470,7 @@ BRCopyBootFilesToDir(CFURLRef srcVol,
     // BRCopyBootFiles() always copies everything fresh
     up.doRPS = up.doBooters = up.doMisc = true;
     up.cleanOnceDir = true;
-
+    // Since cleanOnceDir is true, we will also clean up any old stagingDirs.
     
     // And finally, update!
     if ((errnum = updateBootHelpers(&up))) {
@@ -1576,18 +1607,32 @@ finish:
 ******************************************************************************/
 // helper does wraps BLSetFinderVolumeInfo with schdir()
 static int
-sBLSetBootFinderInfo(struct updatingVol *up, uint32_t newvinfo[8])
+sBLSetBootInfo(struct updatingVol *up, uint64_t newvinfo[8])
 {
-    int result, fd = -1;
-    uint32_t    vinfo[8];
-
+    int result, fd = -1, isAPFS = 0;
     result = schdir(up->curbootfd, up->curMount, &fd);
     if (result)         goto finish;
-    result = BLGetVolumeFinderInfo(NULL, ".", vinfo);
-    if (result)         goto finish;
-    vinfo[kSystemFolderIdx] = newvinfo[kSystemFolderIdx];
-    vinfo[kEFIBooterIdx] = newvinfo[kEFIBooterIdx];
-    result = BLSetVolumeFinderInfo(NULL, ".", vinfo);
+
+    if (BLIsMountAPFS(NULL, up->curMount, &isAPFS) != 0) {
+        result = EINVAL;
+        goto finish;
+    }
+
+    if (isAPFS) {
+        uint64_t    vinfo[2];
+        result = BLGetAPFSBlessData(NULL, ".", vinfo);
+        if (result)         goto finish;
+        vinfo[0] = newvinfo[kEFIBooterIdx];
+        vinfo[1] = newvinfo[kSystemFolderIdx];
+        result = BLSetAPFSBlessData(NULL, ".", vinfo);
+    } else {
+        uint32_t    vinfo[8];
+        result = BLGetVolumeFinderInfo(NULL, ".", vinfo);
+        if (result)         goto finish;
+        vinfo[kSystemFolderIdx] = (uint32_t)newvinfo[kSystemFolderIdx];
+        vinfo[kEFIBooterIdx] = (uint32_t)newvinfo[kEFIBooterIdx];
+        result = BLSetVolumeFinderInfo(NULL, ".", vinfo);
+    }
 
 finish:
     if (fd != -1)  
@@ -1602,12 +1647,14 @@ blessRecovery(struct updatingVol *up)
     int result;
     char path[PATH_MAX];
     struct stat sb;
-    uint32_t vinfo[8] = { 0, };
+    uint64_t vinfo[8] = { 0, };
 
     // look up pathnames & file IDs
     result = ENAMETOOLONG;
 
-    makebootpath(path, "/" kRecoveryBootDir);
+    // recovery dir always lives at the root of the volume
+    pathcpy(path, up->curMount);
+    pathcat(path, "/" kRecoveryBootDir);
     if (stat(path, &sb) == -1) {
         result = errno;
         goto finish;
@@ -1623,9 +1670,15 @@ blessRecovery(struct updatingVol *up)
     }
     vinfo[kEFIBooterIdx] = (uint32_t)sb.st_ino;
 
-    if ((result = sBLSetBootFinderInfo(up, vinfo))) {
+    if ((result = sBLSetBootInfo(up, vinfo))) {
         OSKextLog(NULL, up->warnLogSpec,
                  "Warning: found recovery booter but couldn't bless it.");
+    }
+
+    // flush everything in this helper partition to disk
+    if ((result = fcntl(up->curbootfd, F_FULLFSYNC))) {
+        LOGERRxlate(up, "fcntl(helper, F_FULLFSYNC)", NULL, result);
+        goto finish;
     }
 
 finish:
@@ -1657,7 +1710,7 @@ BREraseBootFiles(CFURLRef srcVolRoot, CFStringRef helperBSDName)
     int opres, firstErrno, firstErr = 0; 
     char path[PATH_MAX], prevRPS[PATH_MAX], nextRPS[PATH_MAX];
     struct stat sb;
-    uint32_t zerowords[8] = { 0, };
+    uint64_t zerowords[8] = { 0, };
     unsigned i;
     struct updatingVol  up = { /* NULL, ... */ }, *upp = &up;
     up.curbootfd = -1;
@@ -1680,7 +1733,7 @@ BREraseBootFiles(CFURLRef srcVolRoot, CFStringRef helperBSDName)
 
     // bless recovery booter if present; else unbless volume
     if ((blessRecovery(&up))) {
-        if ((opres = sBLSetBootFinderInfo(&up, zerowords))) {
+        if ((opres = sBLSetBootInfo(&up, zerowords))) {
             firstErr = opres;
             OSKextLog(NULL, up.warnLogSpec,
                       "Warning: couldn't unbless %s", up.curMount);
@@ -1986,7 +2039,8 @@ _findMountedHelper(struct updatingVol *up)
     for (i = 0; i < nfsys; i++) {
         struct statfs *sfs = &mounts[i];
         if (strlen(sfs->f_mntfromname) < sizeof(_PATH_DEV) ||
-                0 != strcmp(sfs->f_fstypename, "hfs")) {
+                (strcmp(sfs->f_fstypename, "hfs") &&
+                strcmp(sfs->f_fstypename, "apfs"))) {
             continue;
         }
         if (0 == strcmp(sfs->f_mntfromname+strlen(_PATH_DEV), up->bsdname)){
@@ -2111,7 +2165,8 @@ unmountBoot(struct updatingVol *up)
     }
 
     // specifying a target directory => might not be a helper volume!
-    if (up->flatTarget[0])      return;
+    // And if it's a staging directory, the client is responsible for the unmount.
+    if (up->flatTarget[0] || up->useStagingDir) return;
     
     if (up->curMount[0]) {
         OSKextLog(NULL, kOSKextLogDetailLevel | kOSKextLogGeneralFlag,
@@ -2371,6 +2426,22 @@ finish:
     return rval;
 }
 
+static void
+eraseRPSIfRecoveryBlessed(struct updatingVol *up, char *rpsDir)
+{
+    // if we can bless a Recovery OS, remove current files to free up space
+    if (blessRecovery(up) == 0) {
+        int bsderr;
+
+        if ((bsderr = eraseRPS(up, rpsDir)) && errno != ENOENT) {
+            LOGERRxlate(up, rpsDir, "couldn't free up space", bsderr);
+        }
+        // re-bless booters at the end
+        // (This also copies them, but they're small compared to RPS.)
+        up->doBooters = true;
+    }
+}
+
 /* 
  * ucopyRPS - copy new RPS directory to "inactive" location
  * bails on any error because only a whole RPS dir makes sense
@@ -2389,7 +2460,6 @@ ucopyRPS(struct updatingVol *up)
 #endif
     COMPILE_TIME_ASSERT(sizeof(BOOTPLIST_NAME)==sizeof(BOOTPLIST_APM_NAME));
     
-    
     OSKextLog(NULL, kOSKextLogDetailLevel | kOSKextLogGeneralFlag,
               "Copying files used by the booter.");
 
@@ -2405,13 +2475,18 @@ ucopyRPS(struct updatingVol *up)
         }
         pathcat(up->dstdir, up->flatTarget);
         erdir = curRPS;
+        if ((up->blessSpec & kBRBlessOnce) == 0 && (up->blessSpec & kBRBlessRecovery) != 0) {
+            erdir = prevRPS;
+            eraseRPSIfRecoveryBlessed(up, curRPS);
+        }
     } else {
         // we're going to copy into the currently-inactive directory
         pathcpy(up->dstdir, prevRPS);
         erdir = prevRPS;
+        eraseRPSIfRecoveryBlessed(up, curRPS);
     }
 
-    // we expect to have removed it and eraseRPS() doesn't mind it missing
+    // remove any stray target directory
     if ((bsderr = eraseRPS(up, up->dstdir))) {
         rval = bsderr; goto finish;     // error logged by function
     }
@@ -2516,7 +2591,7 @@ ucopyRPS(struct updatingVol *up)
             if ((bsderr = _writeFDEPropsToHelper(up, dstpath))) {                      
                 rval = bsderr; goto finish;     // error logged by function
             }
-	    
+
         } else {
             // could deny zero-size cookies, busted Mach-O, etc here
             // scopyitem creates any intermediate directories
@@ -2526,8 +2601,10 @@ ucopyRPS(struct updatingVol *up)
             if (bsderr) {
                 rval = bsderr == -1 ? errno : bsderr;
                 // erpropcache, efiloccache are optional
-                if ((curItem == up->caches->erpropcache && rval != ENOENT) &&
-                    (curItem == up->caches->efiloccache && rval != ENOENT)) {
+                if (((curItem == up->caches->erpropcache) || (curItem == up->caches->efiloccache)) && (rval == ENOENT)) {
+                    // ENOENT for these items is fine
+                    continue;
+                } else {
                     OSKextLog(0,up->errLogSpec,"Error %d copying %s to %s: %s",
                               rval, srcpath, dstpath, strerror(rval));
                     goto finish;
@@ -2847,7 +2924,7 @@ activateBooters(struct updatingVol *up)
 {
     int errnum, rval = ELAST + 1;
     int fd = -1;
-    uint32_t vinfo[8] = { 0, };
+    uint64_t vinfo[8] = { 0, };
     struct stat sb;
     char parent[PATH_MAX];
     int nbooters = 0;
@@ -2885,11 +2962,7 @@ activateBooters(struct updatingVol *up)
             rval = errno; goto finish;
         }
         CLOSE(fd);
-        if (sb.st_ino < (__darwin_ino64_t)2<<31) {
-            vinfo[kSystemFolderIdx] = (uint32_t)sb.st_ino;
-        } else {
-            rval = EOVERFLOW; goto finish;
-        }
+        vinfo[kSystemFolderIdx] = sb.st_ino;
     }
 
     up->changestate = activatingEFIBooter;
@@ -2900,11 +2973,7 @@ activateBooters(struct updatingVol *up)
             rval = errno; goto finish;
         }
         CLOSE(fd);
-        if (sb.st_ino < (__darwin_ino64_t)2<<31) {
-            vinfo[kEFIBooterIdx] = (uint32_t)sb.st_ino;
-        } else {
-            rval = EOVERFLOW; goto finish;
-        }
+        vinfo[kEFIBooterIdx] = sb.st_ino;
 
         // get folder ID of enclosing folder if not provided by ofbooter
         if (!vinfo[0]) {
@@ -2914,18 +2983,14 @@ activateBooters(struct updatingVol *up)
                 rval = errno; goto finish;
             }
             CLOSE(fd);
-            if (sb.st_ino < (__darwin_ino64_t)2<<31) {
-                vinfo[kSystemFolderIdx] = (uint32_t)sb.st_ino;
-            } else {
-                rval = EOVERFLOW; goto finish;
-            }
+            vinfo[kSystemFolderIdx] = sb.st_ino;
         }
     }
 
     // configure blessing as requested
     // FSDefault is a single unique bit.
     if (up->blessSpec & kBRBlessFSDefault) {
-        if ((errnum = sBLSetBootFinderInfo(up, vinfo))) {
+        if ((errnum = sBLSetBootInfo(up, vinfo))) {
             rval = errnum; goto finish;    
         }
     }

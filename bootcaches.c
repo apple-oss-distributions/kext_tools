@@ -1072,6 +1072,10 @@ needsUpdate(char *root, cachedPath* cpath)
     // check the source file in the root volume
     if (stat(fullrp, &rsb) == 0) {
         rfpresent = true;
+        // zero means "no file exists"; if file's ctime is 0, force to 1
+        if (rsb.st_ctimespec.tv_sec == 0) {
+            rsb.st_ctimespec.tv_sec = 1;
+        }
     } else if (errno == ENOENT) {
         rfpresent = false;
     } else {
@@ -1094,7 +1098,7 @@ needsUpdate(char *root, cachedPath* cpath)
     }
 
     // check on the timestamp file itself
-    // it's invalid if it tracks a non-existant root file
+    // A zero time means that no root file exists (-> stamp is invalid).
     if (stat(fulltsp, &tsb) == 0) {
         if (tsb.st_mtimespec.tv_sec != 0) {
             tsvalid = true;
@@ -1186,6 +1190,10 @@ needUpdates(struct bootCaches *caches, BRUpdateOpts_t opts,
 
     // first check RPS paths
     for (cp = caches->rpspaths; cp < &caches->rpspaths[caches->nrps]; cp++) {
+        // if we've managed to boot, out of date EFILoginResources are fine
+        if ((opts & kBRUEarlyBoot) && cp == caches->efiloccache) {
+            continue;       // ignore EFILoginLocalizations during early boot
+        }
         if (needsUpdate(caches->root, cp)) {
             OSKextLog(NULL, oodLogSpec, "%s " OODMSG, cp->rpath);
             anyOOD = rpsOOD = true;
@@ -1479,12 +1487,11 @@ finish:
 int
 rebuild_kext_boot_cache_file(
     struct bootCaches *caches,
-    Boolean wait,
     const char * kext_boot_cache_file,
-    const char * kernel_file)
+    const char * kernel_file,
+    Boolean startup_kexts_ok)
 {   
     int             rval                    = ELAST + 1;
-    int             pid                     = -1;
     CFIndex i, argi = 0, argc = 0, narchs = 0;
     CFDictionaryRef pbDict, mkDict;
     CFArrayRef      archArray;
@@ -1592,7 +1599,7 @@ rebuild_kext_boot_cache_file(
     if (generateKernelcache) {
         // for '/' only, include all kexts loaded since boot (9130863)
         // TO DO: can we optimize for the install->first boot case?
-        if (0 == strcmp(caches->root, "/")) {
+        if (0 == strcmp(caches->root, "/") && startup_kexts_ok) {
             kcargs[argi++] = "-all-loaded";
         }
         pathcpy(fullkernelp, caches->root);
@@ -1653,24 +1660,17 @@ rebuild_kext_boot_cache_file(
         }
 
     }
-    rval = 0;
 
-   /* wait:false means the return value is <0 for fork/exec failures and
-    * the pid of the forked process if >0.
-    *
-    * wait:true means the return value is <0 for fork/exec failures and
-    * the exit status of the forked process (>=0) otherwise.
-    */
-    pid = fork_program("/usr/sbin/kextcache", kcargs, wait);  // logs errors
+    /* wait:true means the return value is <0 for spawn failures and
+     * the exit status of the forked process (>=0) otherwise.
+     */
+    rval = fork_program("/usr/sbin/kextcache", kcargs, true /*wait*/);  // logs
 
 finish:
-    if (rval) {
+    if (rval == ELAST + 1) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-            "Data error before mkext rebuild.");
-    }
-    if (wait || pid < 0) {
-        rval = pid;
+            "Data error before rebuild of primary kext cache");
     }
 
     if (archstrs) {
@@ -1895,7 +1895,7 @@ CoreStorageCopyFamilyProperties(CoreStorageFamilyRef familyRef); // 18021143
 // on success, caller is responsible for releasing econtext
 int
 copyCSFDEInfo(CFStringRef uuidStr, CFDictionaryRef *econtext,
-               time_t *timeStamp)
+              time_t *timeStamp)
 {
     int             rval = ELAST+1;
     CFDictionaryRef lvfprops = NULL;
@@ -1934,7 +1934,7 @@ copyCSFDEInfo(CFStringRef uuidStr, CFDictionaryRef *econtext,
             *econtext = CFRetain(ectx);
         }
         if (timeStamp) {
-            psRef = CFDictionaryGetValue(ectx, CFSTR(kCSFDELastUpdateTime));
+            psRef = CFDictionaryGetValue(ectx, CFSTR(kCSFDELastUpdateTimeID));
             if (psRef) {
                 if (CFGetTypeID(psRef) != CFNumberGetTypeID() ||
                     !CFNumberGetValue(psRef,kCFNumberSInt64Type,timeStamp)){
@@ -1968,14 +1968,23 @@ check_csfde(struct bootCaches *caches)
 {
     Boolean         needsupdate = false;
     time_t          propStamp, erStamp;
+    struct statfs   sfs;
     char            erpath[PATH_MAX];
     struct stat     ersb;
 
     if (!caches->csfde_uuid || !caches->erpropcache)
         goto finish;
 
-    if (copyCSFDEInfo(caches->csfde_uuid, NULL, &propStamp))
+    if (copyCSFDEInfo(caches->csfde_uuid, NULL, &propStamp)) {
         goto finish;
+    }
+
+    // if necessary, map the FDE timestamp into a valid HFS time
+    if ((int64_t)propStamp > HFS_TIME_END &&
+            fstatfs(caches->cachefd, &sfs) == 0 &&
+            strcmp(sfs.f_fstypename, "hfs") == 0) {
+        propStamp = propStamp % HFS_TIME_END;
+    }
 
     // get property cache file's timestamp
     pathcpy(erpath, caches->root);
@@ -1990,9 +1999,9 @@ check_csfde(struct bootCaches *caches)
         }
     }
 
-    // if we are on a unencrypted core storage volume don't update, 26592318
+    // if we are on a unencrypted CoreStorage volume, don't update
     if (caches->csfde_uuid && erStamp && !propStamp)
-	goto finish;
+        goto finish;
 
     // generally the timestamp advances, but != means out of date
     needsupdate = erStamp != propStamp;
@@ -2169,7 +2178,6 @@ _writeLegacyCSFDECache(struct bootCaches *caches)
     CFDictionaryRef ectx = NULL;
     char           *errmsg;
     char            erpath[PATH_MAX];
-    int             erfd = -1;
 
     errmsg = "invalid argument";
     if (!caches->csfde_uuid || !caches->erpropcache) {
@@ -2219,7 +2227,6 @@ _writeLegacyCSFDECache(struct bootCaches *caches)
     rval = 0;
 
 finish:
-    if (erfd != -1)     close (erfd);
     if (dataVolumes)    CFRelease(dataVolumes);
     if (ectx)           CFRelease(ectx);
 
@@ -2235,6 +2242,7 @@ rebuild_csfde_cache(struct bootCaches *caches)
 {
     int             errnum, rval = ELAST + 1;
     time_t          timeStamp;
+    struct statfs   sfs;
     char            erpath[PATH_MAX] = "<unknown>";
     struct timeval  times[2] = {{ 0, 0 }, { 0, 0 }};
 
@@ -2254,6 +2262,13 @@ rebuild_csfde_cache(struct bootCaches *caches)
     // otherwise, just grab the timestamp so update_boot.c knows to re-fetch
     if ((errnum = copyCSFDEInfo(caches->csfde_uuid, NULL, &timeStamp))) {
         rval = errnum; goto finish;
+    }
+
+    // if necessary, map the FDE timestamp into a valid HFS time
+    if ((int64_t)timeStamp > HFS_TIME_END &&
+            fstatfs(caches->cachefd, &sfs) == 0 &&
+            strcmp(sfs.f_fstypename, "hfs") == 0) {
+        timeStamp = timeStamp % HFS_TIME_END;
     }
     times[0].tv_sec = (__darwin_time_t)timeStamp;
     times[1].tv_sec = (__darwin_time_t)timeStamp;    // mdworker -> atime
@@ -2534,12 +2549,26 @@ rebuild_loccache(struct bootCaches *caches)
     time_t      validModTime = 0;
     int         fd = -1;
     struct timeval times[2];
-    
+    struct statfs  fsbuf;
+
     // prefsb.st_size = 0;  // Analyzer doesn't check get_locres_info(&prefsb)
     bzero(&prefsb, sizeof(prefsb)); // and doesn't know bzero sets st_size = 0
     if ((errnum = get_locres_info(caches, locRsrcDir, prefPath, &prefsb,
                                   locCacheDir, &validModTime))) {
         result = errnum; goto finish;   // error logged by function
+    }
+
+    errnum = fstatfs(caches->cachefd, &fsbuf);
+    if (errnum < 0) {
+        result = errno; LOGERRxlate(locCacheDir, NULL, result);
+        goto finish;
+    }
+    if (fsbuf.f_flags & MNT_NOSUID) {
+        result = errnum = 0;
+        OSKextLog(NULL, kOSKextLogWarningLevel,
+                  "Warning: not updating EFI login resources for nosuid '%s'",
+                  caches->root);
+        goto finish;
     }
 
     // empty out locCacheDir ...
@@ -2847,7 +2876,7 @@ launch_rebuild_all(char * rootPath, Boolean force, Boolean wait)
     if (!kcargs)    goto finish;
 
     kcargs[argi++] = "/usr/sbin/kextcache";
-    // fork_program(wait=false) also sets IOPOL_THROTTLE while spawning
+    // fork_program(wait=false) decreases I/O priority while spawning
     kcargs[argi++] = "-F";      // lower priority within kextcache
     if (force) {
         kcargs[argi++] = "-f";

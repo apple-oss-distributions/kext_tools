@@ -20,6 +20,8 @@
 #include "kext_tools_util.h"
 #include "kernelcache.h"
 #include "bootroot_internal.h"
+#include "security.h"
+
 
 #pragma mark Basic Types & Constants
 /*******************************************************************************
@@ -220,8 +222,10 @@ typedef struct {
 
     CFURLRef  volumeRootURL;        // for prelinked kernel
 
-    char    * prelinkedKernelPath;            // -c option
+    char     *prelinkedKernelPath;            // -c option
+    char     *prelinkedKernelDirname;
     int       prelinkedKernel_fd;
+    int       prelinkedKernelDir_fd;
     Boolean   needDefaultPrelinkedKernelInfo; // -c option w/o arg;
                                               // prelinkedKernelURL is parent
                                               // directory of final kernelcache
@@ -259,6 +263,8 @@ typedef struct {
     struct timeval     extensionsDirTimes[2];   // access and mod times of extensions directory with most recent change
     Boolean     compress;
     Boolean     uncompress;
+
+    AuthOptions_t      authenticationOptions;
 } KextcacheArgs;
 
 #pragma mark Function Prototypes
