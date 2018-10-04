@@ -65,6 +65,7 @@
 #include "fork_program.h"
 #include "kext_tools_util.h"
 #include "safecalls.h"
+#include "signposts.h"
 
 // only used here
 #define kBRDiskArbMaxRetries   (10)
@@ -418,6 +419,7 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
         if (CFDictionaryContainsKey(dict, kBCKernelcacheV1Key)) kcacheKeys++;
         if (CFDictionaryContainsKey(dict, kBCKernelcacheV2Key)) kcacheKeys++;
         if (CFDictionaryContainsKey(dict, kBCKernelcacheV3Key)) kcacheKeys++;
+        if (CFDictionaryContainsKey(dict, kBCKernelcacheV4Key)) kcacheKeys++;
 
         if (kcacheKeys > 1) { 
             // don't support multiple types of kernel caching ...
@@ -435,6 +437,9 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
             }
             if (!mkDict) {
                 mkDict = (CFDictionaryRef)CFDictionaryGetValue(dict, kBCKernelcacheV3Key);
+            }
+            if (!mkDict) {
+                mkDict = (CFDictionaryRef)CFDictionaryGetValue(dict, kBCKernelcacheV4Key);
             }
 
             if (mkDict) {
@@ -1489,8 +1494,9 @@ rebuild_kext_boot_cache_file(
     struct bootCaches *caches,
     const char * kext_boot_cache_file,
     const char * kernel_file,
-    Boolean startup_kexts_ok)
-{   
+    Boolean startup_kexts_ok,
+    Boolean rebuild_immutable_kernel)
+{
     int             rval                    = ELAST + 1;
     CFIndex i, argi = 0, argc = 0, narchs = 0;
     CFDictionaryRef pbDict, mkDict;
@@ -1522,10 +1528,14 @@ rebuild_kext_boot_cache_file(
     */
     do {
         mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV1Key);
-        if (!mkDict)
+        if (!mkDict) {
             mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV2Key);
+        }
         if (!mkDict) {
             mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV3Key);
+        }
+        if (!mkDict) {
+            mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV4Key);
         }
 
         if (mkDict) {
@@ -1584,22 +1594,29 @@ rebuild_kext_boot_cache_file(
         kcargs[argi++] = archstrs[i];
     }
 
-    // BootRoot always includes local kexts
-    kcargs[argi++] = "-local-root";
+    if (rebuild_immutable_kernel) {
+        // rebuilding the immutable kernel implies
+        //     -local-root and -network-root (and "root" and "console")
+        kcargs[argi++] = "-immutable-kexts";
+        kcargs[argi++] = "-build-immutable-kernel";
+    } else {
+        // BootRoot always includes local kexts
+        kcargs[argi++] = "-local-root";
 
-    // 6413843 check if it's installation media (-> add -n)
-    pathcpy(rcpath, caches->root);
-    removeTrailingSlashes(rcpath);       // X caches->root trailing '/'?
-    pathcat(rcpath, "/etc/rc.cdrom");
-    if (stat(rcpath, &sb) == 0) {
-        kcargs[argi++] = "-network-root";
+        // 6413843 check if it's installation media (-> add -n)
+        pathcpy(rcpath, caches->root);
+        removeTrailingSlashes(rcpath);       // X caches->root trailing '/'?
+        pathcat(rcpath, "/etc/rc.cdrom");
+        if (stat(rcpath, &sb) == 0) {
+            kcargs[argi++] = "-network-root";
+        }
     }
 
     // determine proper argument to precede kext_boot_cache_file
     if (generateKernelcache) {
         // for '/' only, include all kexts loaded since boot (9130863)
         // TO DO: can we optimize for the install->first boot case?
-        if (0 == strcmp(caches->root, "/") && startup_kexts_ok) {
+        if (0 == strcmp(caches->root, "/") && startup_kexts_ok && !rebuild_immutable_kernel) {
             kcargs[argi++] = "-all-loaded";
         }
         pathcpy(fullkernelp, caches->root);
@@ -1720,7 +1737,9 @@ plistCachesNeedRebuild(const NXArchInfo * kernelArchInfo)
         if (!_OSKextReadCache(directoryURL, CFSTR(_kOSKextIdentifierCacheBasename),
             /* arch */ NULL, _kOSKextCacheFormatCFBinary, /* parseXML? */ false,
             /* valuesOut*/ NULL)) {
-
+            os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
+                                   SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
+                                   "kext identifier cache out of date: %@", directoryURL);
             goto finish;
         }
     }
@@ -1740,7 +1759,9 @@ plistCachesNeedRebuild(const NXArchInfo * kernelArchInfo)
     if (!_OSKextReadCache(systemExtensionsFolderURLs, cacheBasename,
         kernelArchInfo, _kOSKextCacheFormatCFXML, /* parseXML? */ false,
         /* valuesOut*/ NULL)) {
-        
+        os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
+                               SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
+                               "kext property values cache out of date");
         goto finish;
     }
 
@@ -1754,11 +1775,13 @@ finish:
 Boolean
 check_kext_boot_cache_file(
     struct bootCaches * caches,
-    const char * cache_path,
-    const char * kernel_path)
-{   
+    const char *cache_path,
+    const char *kernel_path,
+    const char *immutable_path)
+{
     Boolean      needsrebuild                       = false;
     char         fullPath[PATH_MAX]                 = "";
+    char         latestPath[PATH_MAX]               = "";
     struct stat  statbuffer;
     time_t       validModtime                       = 0;
     time_t       prelinkedkernelModtime             = 0;
@@ -1790,6 +1813,7 @@ check_kext_boot_cache_file(
 #endif
             if (statbuffer.st_mtime + 1 > validModtime) {
                validModtime = statbuffer.st_mtime + 1;
+               pathcpy(latestPath, fullPath);
             }
         }
         else {
@@ -1828,6 +1852,7 @@ check_kext_boot_cache_file(
          */
         if (statbuffer.st_mtime > validModtime) {
             validModtime = statbuffer.st_mtime + 1;
+            pathcpy(latestPath, fullPath);
         }
     }
 
@@ -1845,9 +1870,41 @@ check_kext_boot_cache_file(
                       CFSTR("%s - %ld <- mod time of %s "),
                       __func__, statbuffer.st_mtime, fullPath);
 #endif
-   
+
     prelinkedkernelModtime = statbuffer.st_mtime;
     needsrebuild = (prelinkedkernelModtime != validModtime);
+
+    if (needsrebuild) {
+        os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
+                               SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
+                               "prelinked kernel out of date due to: %s", latestPath);
+        goto finish;
+    }
+
+    if (immutable_path && immutable_path[0]) {
+        /*
+         * if we're being asked to rebuild the immutable kernel, check to see if
+         * it's last modtime is up to date
+         */
+        pathcpy(fullPath, caches->root);
+        removeTrailingSlashes(fullPath);
+        pathcat(fullPath, immutable_path);
+
+        // if the stat fails, the immutable kernel doesn't exist (and thus needs rebuilding)
+        needsrebuild = true;
+        if (stat(fullPath, &statbuffer) == -1) {
+            os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
+                                   SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
+                                   "immutable kernel doesn't exist");
+            goto finish;
+        }
+        needsrebuild = ((time_t)statbuffer.st_mtime != validModtime);
+        if (needsrebuild) {
+            os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
+                                   SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
+                                   "immutable kernel out of date due to: %s", latestPath);
+        }
+    }
 
 finish:
     return needsrebuild;
@@ -2005,6 +2062,9 @@ check_csfde(struct bootCaches *caches)
 
     // generally the timestamp advances, but != means out of date
     needsupdate = erStamp != propStamp;
+    if (needsupdate) {
+        os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE, SIGNPOST_EVENT_CSFDE_NEEDS_UPDATE);
+    }
 
 finish:
     return needsupdate;
@@ -2869,7 +2929,7 @@ launch_rebuild_all(char * rootPath, Boolean force, Boolean wait)
     pid_t rval = -1;
     int argc, argi = 0; 
     char **kcargs = NULL;
-    
+
     //  argv[0] '-F'  '-u'  root          -f ?       NULL
     argc =  1  +  1  +  1  +  1  + (force == true) +  1;
     kcargs = malloc(argc * sizeof(char*));
@@ -2891,6 +2951,7 @@ launch_rebuild_all(char * rootPath, Boolean force, Boolean wait)
     * the pid of the forked process if >0.
     */
     rval = fork_program(kcargs[0], kcargs, wait);
+    os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE, SIGNPOST_EVENT_FORK_KEXTCACHE, "%s", rootPath);
 
 finish:
     if (kcargs)     free(kcargs);

@@ -2,7 +2,7 @@
  *  security.h
  *  kext_tools
  *
- *  Copyright 20012 Apple Inc. All rights reserved.
+ *  Copyright 2019 Apple Inc. All rights reserved.
  *
  */
 #ifndef _SECURITY_H
@@ -35,6 +35,11 @@
 
 #define kMessageTracerSignatureTypeKey "com.apple.message.signaturetype"
 #define kMessageTracerPathKey       "com.apple.message.kextpath"
+#define kMessageTracerExecPathKey   "com.apple.message.kextexecpath"
+#define kMessageTracerCodelessKey   "com.apple.message.codeless"
+#define kMessageTracerPersonalityNamesKey   "com.apple.message.personalitynames"
+#define kMessageTracerSigningTimeKey   "com.apple.message.signingtime"
+#define kMessageTracerUserLoadKey      "com.apple.message.userload"
 
 #define kAppleKextWithAppleRoot \
 "Apple kext with Apple root"
@@ -50,13 +55,13 @@
 "Unsigned kext"
 
 /* "com.apple.libkext.kext.loading" was used in 10.8
- * "com.apple.libkext.kext.loading.v3"  is used in 10.9 */
-#define kMTKextLoadingDomain        "com.apple.libkext.kext.loading.v3"
+ * "com.apple.libkext.kext.loading.v4"  is used in LoboFox+ */
+#define kMTKextLoadingDomain        "com.apple.libkext.kext.loading.v4"
 #define kMTKextBlockedDomain        "com.apple.libkext.kext.blocked"
 
 void    messageTraceExcludedKext(OSKextRef aKext);
-void    recordKextLoadListForMT(CFArrayRef kextList);
-void    recordKextLoadForMT(OSKextRef aKext);
+void    recordKextLoadListForMT(CFArrayRef kextList, Boolean userLoad);
+void    recordKextLoadForMT(OSKextRef aKext, Boolean userLoad);
 
 OSStatus checkKextSignature(OSKextRef aKext,
                             Boolean checkExceptionList,
@@ -71,6 +76,8 @@ Boolean isKextdRunning(void);
 int callSecKeychainMDSInstall( void );
 
 void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer, CFDictionaryRef codesignAttributes);
+
+Boolean isNetBooted(void);
 
 // A set of authentication options for use with the global authentication function.
 typedef struct AuthOptions {

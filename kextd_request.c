@@ -56,6 +56,7 @@
 
 #include "bootcaches.h"
 #include "security.h"
+#include "signposts.h"
 #include "staging.h"
 #include "syspolicy.h"
 
@@ -81,8 +82,7 @@ void kextdProcessKernelResourceRequest(
     CFDictionaryRef   request);
 kern_return_t kextdProcessUserLoadRequest(
     CFDictionaryRef request,
-    uid_t           remote_euid,
-    pid_t           remote_pid);
+    audit_token_t   audit_token);
 static OSReturn checkNonrootLoadAllowed(
     OSKextRef kext,
     uid_t     remote_euid,
@@ -90,7 +90,8 @@ static OSReturn checkNonrootLoadAllowed(
 
 #pragma mark KextManager RPC routines & support
 /*******************************************************************************
-*******************************************************************************/
+ * MIG Server Routine
+ *******************************************************************************/
 kern_return_t _kextmanager_path_for_bundle_id(
     mach_port_t       server,
     kext_bundle_id_t  bundle_id,
@@ -172,9 +173,10 @@ finish:
 
 #pragma mark Loginwindow RPC routines & support
 /*******************************************************************************
-* This function is executed in the main thread after its run loop gets
-* kicked by a client request.
-*******************************************************************************/
+ * MIG Server Routine
+ * This function is executed in the main thread after its run loop gets
+ * kicked by a client request.
+ *******************************************************************************/
 kern_return_t _kextmanager_create_property_value_array(
     mach_port_t  server,
     char        * property_key,
@@ -472,6 +474,9 @@ kextdProcessKernelLoadRequest(CFDictionaryRef   request)
     char          * kext_id         = NULL;  // must free
     char            crashInfo[sizeof(CRASH_INFO_KERNEL_KEXT_LOAD) + KMOD_MAX_NAME + PATH_MAX];
     CFArrayRef      pluginKexts     = NULL;  // must release
+    os_signpost_id_t spid           = generate_signpost_id();
+
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTD_KERNEL_LOAD);
 
     requestArgs = request ? CFDictionaryGetValue(request,
         CFSTR(kKextRequestArgumentsKey)) : NULL;
@@ -542,6 +547,8 @@ kextdProcessKernelLoadRequest(CFDictionaryRef   request)
         goto finish;
     }
 
+    signpost_kext_properties(ownedKext, spid);
+
     if (ownedKext != osKext) {
         // If staging was performed, reload the array of plug-ins that need to be updated
         // to match the staged location and swap the staged kext into the osKext reference.
@@ -588,8 +595,7 @@ kextdProcessKernelLoadRequest(CFDictionaryRef   request)
     /*
      * The extension is definitely being loaded, so log it then perform the load.
      */
-    recordKextLoadForMT(osKext);
-
+    recordKextLoadForMT(osKext, false);
     osLoadResult = OSKextLoadWithOptions(osKext,
         /* startExclusion */ kOSKextExcludeNone,
         /* addPersonalitiesExclusion */ kOSKextExcludeAll,
@@ -633,6 +639,9 @@ finish:
     }
 #endif // HAVE_DANGERZONE
 
+    os_signpost_event_emit(get_signpost_log(), spid, SIGNPOST_EVENT_RESULT, "%d", osLoadResult);
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTD_KERNEL_LOAD);
+
     SAFE_RELEASE(pluginKexts);
     SAFE_RELEASE(loadList);
     SAFE_FREE(kext_id);
@@ -660,6 +669,7 @@ kextdProcessKernelResourceRequest(
     CFStringRef     kextIdentifier         = NULL;  // do not release
     CFStringRef     resourceName           = NULL;  // do not release
     CFURLRef        kextURL                = NULL;  // do not release
+    os_signpost_id_t  spid                 = generate_signpost_id();
     char          * kextIdentifierCString  = NULL;  // must free
     char          * resourceNameCString    = NULL;  // must free
     char            kextPathCString[PATH_MAX];
@@ -676,6 +686,9 @@ kextdProcessKernelResourceRequest(
     OSKextLog(/* kext */ NULL,
         kOSKextLogDebugLevel | kOSKextLogIPCFlag,
         "Request for resource.");
+
+    spid = generate_signpost_id();
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTD_KERNEL_RESOURCE);
 
     if (!requestArgs) {
         OSKextLog(/* kext */ NULL,
@@ -793,6 +806,8 @@ kextdProcessKernelResourceRequest(
 finish:
     // now we send it to the kernel
     (void) _OSKextSendResource(request, requestResult, resource);
+    os_signpost_event_emit(get_signpost_log(), spid, SIGNPOST_EVENT_RESULT, "%d", requestResult);
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTD_KERNEL_RESOURCE);
 
     SAFE_RELEASE(resource);
     SAFE_RELEASE(osKext);
@@ -804,8 +819,9 @@ finish:
 
 #pragma mark User Space Kext Load Requests
 /*******************************************************************************
-* User space load request.
-*******************************************************************************/
+ * MIG Server Routine
+ * User space load request.
+ *******************************************************************************/
 kern_return_t
 _kextmanager_load_kext(
     mach_port_t   server,
@@ -817,8 +833,6 @@ _kextmanager_load_kext(
     CFDataRef       requestData = NULL;  // must release
     CFDictionaryRef request     = NULL;  // must release
     CFErrorRef      error       = NULL;  // must release
-    pid_t           remote_pid  = -1;
-    uid_t           remote_euid = -1;
 
     requestData = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault,
         (const UInt8 *)xml_data_in, xml_data_length,
@@ -846,11 +860,7 @@ _kextmanager_load_kext(
         goto finish;
     }
 
-    audit_token_to_au32(audit_token, /* audit UID */ NULL,
-            &remote_euid, /* egid */ NULL, /* ruid */ NULL, /* rgid */ NULL,
-            &remote_pid, /* asid */ NULL, /* au_tid_t */ NULL);
-
-    result = kextdProcessUserLoadRequest(request, remote_euid, remote_pid);
+    result = kextdProcessUserLoadRequest(request, audit_token);
 
 finish:
     SAFE_RELEASE(requestData);
@@ -860,9 +870,7 @@ finish:
     OSKextFlushInfoDictionary(NULL /* all kexts */);
     OSKextFlushLoadInfo(NULL /* all kexts */, /* flushDependencies */ true);
 
-   /* MIG is consume-on-success
-    * xxx - do we need separate result & op-result?
-    */
+    /* MIG is consume-on-success */
     if (result == kOSReturnSuccess) {
         vm_deallocate(mach_task_self(), (vm_address_t)xml_data_in,
             (vm_size_t)xml_data_length);
@@ -894,9 +902,35 @@ const char * nameForPID(pid_t pid)
 #define UNKNOWN_KEXT  "unknown kext"
 #define SYSTEM_FOLDER "/System/"
 
-#define _kSystemExtensionsDirSlash   (kSystemExtensionsDir "/")
-#define _kLibraryExtensionsDirSlash   (kLibraryExtensionsDir "/")
 #define _kSystemFilesystemsDirSlash  ("/System/Library/Filesystems/")
+
+static Boolean inExtensionsDir(const char *urlPathCString)
+{
+    char extensionPath[PATH_MAX];
+    CFArrayRef extensionsFolderURLs = OSKextGetSystemExtensionsFolderURLs();
+    CFIndex count = CFArrayGetCount(extensionsFolderURLs);
+    for (CFIndex i = 0; i < count; i++) {
+        CFURLRef directoryURL = CFArrayGetValueAtIndex(extensionsFolderURLs, i);
+        if (!CFURLGetFileSystemRepresentation(directoryURL, /* resolveToBase? */ TRUE,
+                                              (UInt8 *)extensionPath, sizeof(extensionPath) - 1))
+            continue;
+
+        size_t len = strlen(extensionPath);
+        if (len == 0)
+            continue;
+
+        // Append trailing slash if necessary, we don't want a false
+        // positive on something like /Library/ExtensionsFake/rootkit.kext 
+        if (extensionPath[len - 1] != '/') {
+            extensionPath[len] = '/';
+            extensionPath[len + 1] = '\0';
+            ++len;
+        }
+        if (!strncmp(urlPathCString, extensionPath, len))
+            return TRUE;
+    }
+    return FALSE;
+}
 
 /*******************************************************************************
 *******************************************************************************/
@@ -906,11 +940,10 @@ static CFURLRef createAbsOrRealURLForURL(
     pid_t      remote_pid,
     OSReturn * error)
 {
-    CFURLRef result      = NULL;
-    OSReturn localError  = kOSReturnSuccess;
-    Boolean  inLE        = FALSE;
-    Boolean  inSLE       = FALSE;
-    Boolean  inSLF       = FALSE;
+    CFURLRef result       = NULL;
+    OSReturn localError   = kOSReturnSuccess;
+    Boolean  inSLF        = FALSE;
+    Boolean  inExtensions = FALSE;
     char     urlPathCString[PATH_MAX];
     char     realpathCString[PATH_MAX];
 
@@ -932,27 +965,17 @@ static CFURLRef createAbsOrRealURLForURL(
         }
         goto finish;
     } else {
-
-        inSLE = (0 == strncmp(urlPathCString, _kSystemExtensionsDirSlash,
-                              strlen(_kSystemExtensionsDirSlash)));
-        inLE = (0 == strncmp(urlPathCString, _kLibraryExtensionsDirSlash,
-                             strlen(_kLibraryExtensionsDirSlash)));
         inSLF = (0 == strncmp(urlPathCString, _kSystemFilesystemsDirSlash,
                               strlen(_kSystemFilesystemsDirSlash)));
+        inExtensions = inExtensionsDir(urlPathCString);
 
-       /*****
-        * May want to open these checks to use OSKextGetSystemExtensionsFolderURLs().
-        * For now, keep it tight and just do /System/Library/Extensions & Filesystems.
-        */
-        if (!inSLE && !inSLF && !inLE) {
+        if (!inSLF && !inExtensions) {
             localError = kOSKextReturnNotPrivileged;
-            if (!inSLE && !inSLF) {
-                OSKextLog(/* kext */ NULL,
-                    kOSKextLogErrorLevel | kOSKextLogLoadFlag | kOSKextLogIPCFlag,
-                    "Request from non-root process '%s' (euid %d) to load %s - "
-                          "not in extensions dirs or filesystems folder.",
-                    nameForPID(remote_pid), remote_euid, urlPathCString);
-            }
+            OSKextLog(/* kext */ NULL,
+                kOSKextLogErrorLevel | kOSKextLogLoadFlag | kOSKextLogIPCFlag,
+                "Request from non-root process '%s' (euid %d) to load %s - "
+                      "not in extensions dirs or filesystems folder.",
+                nameForPID(remote_pid), remote_euid, urlPathCString);
             goto finish;
         }
 
@@ -968,14 +991,11 @@ static CFURLRef createAbsOrRealURLForURL(
        /*****
         * Check the path once more now that we've resolved it with realpath().
         */
-        inSLE = (0 == strncmp(realpathCString, _kSystemExtensionsDirSlash,
-                              strlen(_kSystemExtensionsDirSlash)));
-        inLE = (0 == strncmp(realpathCString, _kLibraryExtensionsDirSlash,
-                             strlen(_kLibraryExtensionsDirSlash)));
         inSLF = (0 == strncmp(realpathCString, _kSystemFilesystemsDirSlash,
                               strlen(_kSystemFilesystemsDirSlash)));
+        inExtensions = inExtensionsDir(realpathCString);
 
-        if (!inSLE && !inSLF && !inLE) {
+        if (!inSLF && !inExtensions) {
 
             localError = kOSKextReturnNotPrivileged;
             OSKextLog(/* kext */ NULL,
@@ -1083,8 +1103,7 @@ finish:
 kern_return_t
 kextdProcessUserLoadRequest(
     CFDictionaryRef request,
-    uid_t           remote_euid,
-    pid_t           remote_pid)
+    audit_token_t   audit_token)
 {
     OSReturn          result                   = kOSReturnSuccess;
     CFStringRef       kextID                   = NULL;  // do not release
@@ -1105,6 +1124,22 @@ kextdProcessUserLoadRequest(
     char              crashInfo[sizeof(CRASH_INFO_USER_KEXT_LOAD) +
                       KMOD_MAX_NAME + PATH_MAX];
     CFIndex           count, index;
+    os_signpost_id_t  spid                     = generate_signpost_id();
+
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTD_USER_LOAD);
+
+    pid_t remote_pid  = -1;
+    uid_t remote_euid = -1;
+
+    audit_token_to_au32(audit_token,
+                        /* audit UID */ NULL,
+                        &remote_euid,
+                        /* egid */ NULL,
+                        /* ruid */ NULL,
+                        /* rgid */ NULL,
+                        &remote_pid,
+                        /* asid */ NULL,
+                        /* au_tid_t */ NULL);
 
    /* First get the identifier or URL to load, and convert it to a C string
     * for logging.
@@ -1282,6 +1317,8 @@ kextdProcessUserLoadRequest(
         goto finish;
     }
 
+    signpost_kext_properties(theKext, spid);
+
     if (remote_euid != 0) {
         result = checkNonrootLoadAllowed(theKext, remote_euid, remote_pid);
         if (result != kOSReturnSuccess) {
@@ -1292,9 +1329,9 @@ kextdProcessUserLoadRequest(
     /* consult sandboxing system to make sure this is OK
      * <rdar://problem/11015459
      */
-    if (sandbox_check(remote_pid, "system-kext-load",
-                      SANDBOX_FILTER_KEXT_BUNDLE_ID,
-                      kextIDString) != 0 )  {
+    if (sandbox_check_by_audit_token(audit_token, "system-kext-load",
+                                     SANDBOX_FILTER_KEXT_BUNDLE_ID,
+                                     kextIDString) != 0 )  {
         OSKextLog(NULL,
                   kOSKextLogErrorLevel | kOSKextLogArchiveFlag |
                   kOSKextLogValidationFlag | kOSKextLogGeneralFlag,
@@ -1405,7 +1442,7 @@ kextdProcessUserLoadRequest(
     /*
      * The extension is definitely being loaded, so log it then perform the load.
      */
-    recordKextLoadForMT(theKext);
+    recordKextLoadForMT(theKext, true);
 
     /* The codepath from this function will do any error logging
      * and cleanup needed.
@@ -1427,6 +1464,9 @@ finish:
         dzRecordKextLoadUser(theKext, allowed);
     }
 #endif // HAVE_DANGERZONE
+
+    os_signpost_event_emit(get_signpost_log(), spid, SIGNPOST_EVENT_RESULT, "%d", result);
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTD_USER_LOAD);
 
     SAFE_RELEASE(kextURL);
     SAFE_RELEASE(kextAbsURL);

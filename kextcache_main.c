@@ -66,6 +66,7 @@
 
 #include "kextcache_main.h"
 #include "kext_tools_util.h"
+#include "fork_program.h"
 #if !NO_BOOT_ROOT
 #include "bootcaches.h"
 #include "bootroot_internal.h"
@@ -73,8 +74,9 @@
 //#include "mkext1_file.h"
 #include "compression.h"
 #include "security.h"
-#include "syspolicy.h"
+#include "signposts.h"
 #include "staging.h"
+#include "syspolicy.h"
 
 #if __has_include(<prelink.h>)
 /* take prelink.h from host side tools SDK */
@@ -105,6 +107,8 @@
  * won't even be able to see those partitions.
  */
 #define kPLKDirSymlinkPrefix "../../../PrelinkedKernels/"
+
+#define kPersonalizeMacOSTool "/usr/local/bin/personalize_macos"
 
 /*******************************************************************************
 * Program Globals
@@ -137,6 +141,9 @@ static bool isSystemPLKPath(KextcacheArgs *toolArgs);
 static bool isSystemKernelPath(KextcacheArgs *toolArgs);
 static bool isProbablyProtectedPLK(KextcacheArgs *toolArgs);
 static bool isProtectedPLK(int prelinkedKernel_fd);
+static bool isProtectedAction(KextcacheArgs *toolArgs);
+static bool isSecureAuthentication(KextcacheArgs *toolArgs);
+static ExitStatus buildImmutableKernelcache(KextcacheArgs *toolArgs, const char *plk_filename);
 
 /*******************************************************************************
 *******************************************************************************/
@@ -169,6 +176,8 @@ int main(int argc, char * const * argv)
         OSKextSetLogFilter(kDefaultServiceLogFilter | kOSKextLogKextOrGlobalMask,
             /* kernel? */ true);
         tool_openlog("com.apple.kextcache");
+    } else {
+        tool_initlog();
     }
 
     if (isDebugSetInBootargs()) {
@@ -242,14 +251,14 @@ int main(int argc, char * const * argv)
      * to this value in the future.  If this function is used again directly, the return value
      * may change and make any security checks susceptible to TOCTOU issues.
      */
-    bool targetsRunningSystem = isProbablyProtectedPLK(&toolArgs);
+    bool protectedAction = isProtectedAction(&toolArgs);
 
     toolArgs.authenticationOptions.allowNetwork = isKextdRunning();
     toolArgs.authenticationOptions.isCacheLoad = true;
     toolArgs.authenticationOptions.performFilesystemValidation = !toolArgs.skipAuthentication;
     toolArgs.authenticationOptions.performSignatureValidation = !toolArgs.skipAuthentication && isValidKextSigningTargetVolume(toolArgs.volumeRootURL);
-    toolArgs.authenticationOptions.requireSecureLocation = !toolArgs.skipAuthentication && targetsRunningSystem;
-    toolArgs.authenticationOptions.respectSystemPolicy = !toolArgs.skipAuthentication;
+    toolArgs.authenticationOptions.requireSecureLocation = !toolArgs.skipAuthentication && protectedAction;
+    toolArgs.authenticationOptions.respectSystemPolicy = !toolArgs.skipAuthentication && protectedAction;
 
     _OSKextSetAuthenticationFunction(&authenticateKext, &toolArgs.authenticationOptions);
     _OSKextSetStrictAuthentication(true);
@@ -281,6 +290,22 @@ int main(int argc, char * const * argv)
     */
     OSKextSetUsesCaches(false);
 
+    /* Staging stuff.
+     */
+    if (toolArgs.clearStaging) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogDetailLevel | kOSKextLogGeneralFlag,
+                  "Clearing staging directory.");
+        clearStagingDirectory();
+        goto finish;
+    } else if (toolArgs.pruneStaging) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogDetailLevel | kOSKextLogGeneralFlag,
+                  "Pruning staging directory.");
+        pruneStagingDirectory();
+        goto finish;
+    }
+
 #if !NO_BOOT_ROOT
    /* If it's a Boot!=root update or -invalidate invocation (both will set
     * updateVolumeURL), call checkUpdateCachesAndBoots() with the 
@@ -288,18 +313,26 @@ int main(int argc, char * const * argv)
     * combine with more manual cache-building operations.
     */
     if (toolArgs.updateVolumeURL) {
+        Boolean     gotVolPath = false;
+        Boolean     targetingBootVol = false;
+        char        volPath[PATH_MAX];
+
+        gotVolPath = CFURLGetFileSystemRepresentation(toolArgs.updateVolumeURL,
+                                                      true,
+                                                      (UInt8*)volPath,
+                                                      PATH_MAX);
+        targetingBootVol = (gotVolPath && strcmp(volPath, "/") == 0);
+
+        takeVolumeForPath(volPath);
+
         // go ahead and do the update
         result = doUpdateVolume(&toolArgs);
 
-        if (result == 0 && toolArgs.updateOpts & kBRUInvalidateKextcache) {
-            Boolean         gotVolPath = false;
-            char            volPath[PATH_MAX];
-            
-            gotVolPath = CFURLGetFileSystemRepresentation(toolArgs.updateVolumeURL,
-                                                          true,
-                                                          (UInt8*)volPath,
-                                                          PATH_MAX);
-            if (gotVolPath && 0 == strcmp(volPath, "/")) {
+        if (targetingBootVol) {
+            // For any update or invalidate, always prune the staging directory.
+            pruneStagingDirectory();
+
+            if (result == 0 && toolArgs.updateOpts & kBRUInvalidateKextcache) {
                 // 16803220 - make sure to update other cache files too if we're
                 // targeting the boot volume and we invalidated the prelinkedkernel.
                 // Don't care about result here (we want the doUpdateVolume result)
@@ -311,6 +344,8 @@ int main(int argc, char * const * argv)
                 updateSystemPlistCaches(&toolArgs);
             }
         }
+
+        putVolumeForPath(volPath, result);
         goto finish;
     }
 #endif /* !NO_BOOT_ROOT */
@@ -694,6 +729,17 @@ ExitStatus readArgs(
                 }
                 break;
 
+            case kOptBuildImmutable:
+                if (access(kPersonalizeMacOSTool, R_OK|X_OK) == 0) {
+                    toolArgs->buildImmutableKernel = true;
+                    toolArgs->updateOpts |= kBRUImmutableKernel;
+                } else {
+                    OSKextLog(/* kext */ NULL,
+                              kOSKextLogWarningLevel | kOSKextLogGeneralFlag,
+                              "WARNING: Cannot find personalization tool to build immutable kernel: skipping!");
+                }
+                break;
+
             case kOptNoAuthentication:
                 toolArgs->skipAuthentication = true;
                 break;
@@ -791,6 +837,22 @@ ExitStatus readArgs(
                         toolArgs->updateOpts |= kBRUEarlyBoot;
                         break;
 #endif /* !NO_BOOT_ROOT */
+
+                    case kLongOptImmutableKexts:
+                        /* -default-boot overrides all other kext filtering options */
+                        toolArgs->requiredFlagsRepositoriesOnly = kImmutableKernelKextFilter;
+                        break;
+                    case kLongOptImmutableKextsAll:
+                        /* -default-boot-all overrides all other kext filtering options */
+                        toolArgs->requiredFlagsAll = kImmutableKernelKextFilter;
+                        break;
+
+                    case kLongOptClearStaging:
+                        toolArgs->clearStaging = true;
+                        break;
+                    case kLongOptPruneStaging:
+                        toolArgs->pruneStaging = true;
+                        break;
 
                     default:
                        /* Because we use ':', getopt_long doesn't print an error message.
@@ -970,6 +1032,9 @@ ExitStatus doUpdateVolume(KextcacheArgs *toolArgs)
     int result;                         // errno-type value
     IOReturn pmres = kIOReturnError;    // init against future re-flow
     IOPMAssertionID awakeForUpdate;     // valid if pmres == 0
+    os_signpost_id_t spid = generate_signpost_id();
+
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTCACHE_UPDATE_VOLUME);
 
     // unless -F is passed, keep machine awake for for duration
     // (including waiting for any volume locks with kextd)
@@ -981,8 +1046,9 @@ ExitStatus doUpdateVolume(KextcacheArgs *toolArgs)
         if (pmres) {
             OSKextLog(NULL, kOSKextLogWarningLevel | kOSKextLogGeneralFlag,
                       "Warning: couldn't block sleep during cache update");
+        } else {
+            os_signpost_event_emit(get_signpost_log(), spid, SIGNPOST_EVENT_POWER_ASSERTION);
         }
-
     }
 
     result = checkUpdateCachesAndBoots(toolArgs->updateVolumeURL,
@@ -1001,6 +1067,7 @@ ExitStatus doUpdateVolume(KextcacheArgs *toolArgs)
                       "Warning: error re-enabling sleep after cache update");
     }
 
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTCACHE_UPDATE_VOLUME);
     return rval;
 }
 
@@ -1489,12 +1556,34 @@ ExitStatus checkArgs(KextcacheArgs * toolArgs)
     Boolean expectUpToDate = toolArgs->updateOpts & kBRUExpectUpToDate;
 
     if (!toolArgs->prelinkedKernelPath &&
-        !toolArgs->updateVolumeURL && !toolArgs->updateSystemCaches) 
+        !toolArgs->updateVolumeURL && !toolArgs->updateSystemCaches &&
+        !toolArgs->clearStaging && !toolArgs->pruneStaging)
     {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
             "No work to do; check options and try again.");
         goto finish;
+    }
+
+    if (toolArgs->clearStaging || toolArgs->pruneStaging)
+    {
+        if (toolArgs->prelinkedKernelPath ||
+            toolArgs->updateVolumeURL ||
+            toolArgs->updateSystemCaches)
+        {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "Kernel extension staging functions must be used alone.");
+            goto finish;
+        }
+
+        if (geteuid() != 0) {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                      "You must be running as root to manage the kernel extension staging area.");
+            result = EX_NOPERM;
+            goto finish;
+        }
     }
     
     if (toolArgs->volumeRootURL &&
@@ -1508,7 +1597,8 @@ ExitStatus checkArgs(KextcacheArgs * toolArgs)
     }
 
     if (!toolArgs->updateVolumeURL && !CFArrayGetCount(toolArgs->argURLs) &&
-        !toolArgs->compress && !toolArgs->uncompress) 
+        !toolArgs->compress && !toolArgs->uncompress &&
+        !toolArgs->clearStaging && !toolArgs->pruneStaging)
     {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
@@ -1657,6 +1747,55 @@ ExitStatus checkArgs(KextcacheArgs * toolArgs)
         }
     }
 
+    if (toolArgs->buildImmutableKernel) {
+#if DEV_KERNEL_SUPPORT
+        /*
+         * building and personalizing the immutable kernel requires root privilege
+         */
+        if (geteuid() != 0) {
+            OSKextLog(/* kext */ NULL,
+                    kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                    "You must be running as root to replace the immutable kernel.");
+            result = EX_NOPERM;
+            goto finish;
+        }
+
+        /*
+         * If extra kexts or repositories are specified, output a warning that this
+         * will be a non-standard immutable kernel.
+         */
+        if (CFArrayGetCount(toolArgs->namedKextURLs) || CFSetGetCount(toolArgs->kextIDs) ||
+            ((CFArrayGetCount(toolArgs->repositoryURLs) > 0) &&
+              !CFEqual(toolArgs->repositoryURLs, OSKextGetSystemExtensionsFolderURLs()))) {
+            OSKextLog(/* kext */ NULL,
+                    kOSKextLogWarningLevel | kOSKextLogGeneralFlag,
+                    "WARNING: You have specified custom kexts or kext repository "
+                    "directories, and you are replacing your immutable kernel. "
+                    "The end result will *not* be a standard immutablekernel!");
+        }
+
+        /* default to building the standard immutable kernel */
+        if (!toolArgs->requiredFlagsRepositoriesOnly && !toolArgs->requiredFlagsAll) {
+            toolArgs->requiredFlagsRepositoriesOnly = kImmutableKernelKextFilter;
+            toolArgs->requiredFlagsAll = kImmutableKernelKextFilter;
+        }
+
+        if (toolArgs->requiredFlagsRepositoriesOnly != kImmutableKernelKextFilter ||
+            toolArgs->requiredFlagsAll != kImmutableKernelKextFilter) {
+            OSKextLog(/* kext */ NULL,
+                    kOSKextLogWarningLevel | kOSKextLogGeneralFlag,
+                    "WARNING: You are building an immutable kernel with a non-standard filter!");
+        }
+#else /* !DEV_KERNEL_SUPPORT */
+        /* this code path is not supported (probably not compiled anywhere) */
+        OSKextLog(/* kext */ NULL,
+                kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                "No support for updating the immutable kernel!");
+        result = EX_NOPERM;
+        goto finish;
+#endif /* DEV_KERNEL_SUPPORT */
+    }
+
     /* This is best-effort check to present nice error messages to users.  Since a static check
      * up-front is vulnerable to race conditions, these conditions will be validated again later
      * when it can make a race-free check on the actual file descriptor (that isn't available here).
@@ -1725,13 +1864,28 @@ ExitStatus updateSystemPlistCaches(KextcacheArgs * toolArgs)
     ExitStatus         result               = EX_OSERR;
     ExitStatus         directoryResult      = EX_OK;  // flipped to error as needed
     CFArrayRef         systemExtensionsURLs = NULL;   // do not release
-    CFArrayRef         kexts                = NULL;   // must release
+    CFArrayRef         unauthenticatedKexts = NULL;   // must release
+    CFMutableArrayRef  authenticKexts       = NULL;   // must release
     CFURLRef           folderURL            = NULL;   // do not release
     char               folderPath[PATH_MAX] = "";
     const NXArchInfo * startArch            = OSKextGetArchitecture();
     CFArrayRef         directoryValues      = NULL;   // must release
     CFArrayRef         personalities        = NULL;   // must release
+    os_signpost_id_t   spid                 = generate_signpost_id();
     CFIndex            count, i;
+
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTCACHE_UPDATE_PLISTS);
+
+   /* The system plist caches are always operating on the current system volume, so
+    * we should ensure that the authentication options are secure, or SIP is disabled.
+    */
+    if (!isSecureAuthentication(toolArgs)) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "Unable to update system caches with current authentication options.");
+        result = EX_NOPERM;
+        goto finish;
+    }
 
    /* We only care about updating info for the system extensions folders.
     */
@@ -1742,9 +1896,34 @@ ExitStatus updateSystemPlistCaches(KextcacheArgs * toolArgs)
         goto finish;
     }
 
-    kexts = OSKextCreateKextsFromURLs(kCFAllocatorDefault, systemExtensionsURLs);
-    if (!kexts) {
+    /* Since only authenticated personalities can be sent to the kernel, and authentication
+     * requires them being in a secure location, staging must happen here.  Since
+     * this function is only called for the current system volume, it should always require
+     * staging unless SIP is disabled, which staging already takes care of checking.
+     */
+    unauthenticatedKexts = createStagedKextsFromURLs(systemExtensionsURLs, false);
+    if (!unauthenticatedKexts) {
         goto finish;
+    }
+
+    if (!createCFMutableArray(&authenticKexts, &kCFTypeArrayCallBacks)) {
+        OSKextLogMemError();
+        result = EX_OSERR;
+        goto finish;
+    }
+
+    /* Any kernel extension evaluated below is being evaluated for its personalities
+     * and not for inclusion in the kernel cache, so update the authentication options for
+     * the remainder of this function and ensure it gets set back to true in the end.
+     */
+    toolArgs->authenticationOptions.isCacheLoad = false;
+
+    count = CFArrayGetCount(unauthenticatedKexts);
+    for (i = 0; i < count; i++) {
+        OSKextRef aKext = (OSKextRef)CFArrayGetValueAtIndex(unauthenticatedKexts, i);
+        if (OSKextIsAuthentic(aKext)) {
+            CFArrayAppendValue(authenticKexts, aKext);
+        }
     }
 
    /* Update the global personalities & property-value caches, each per arch.
@@ -1761,11 +1940,11 @@ ExitStatus updateSystemPlistCaches(KextcacheArgs * toolArgs)
             goto finish;
         }
 
-        personalities = OSKextCopyPersonalitiesOfKexts(kexts);
+        personalities = OSKextCopyPersonalitiesOfKexts(authenticKexts);
         if (!personalities) {
             goto finish;
         }
-        
+
         if (!_OSKextWriteCache(systemExtensionsURLs, CFSTR(kIOKitPersonalitiesKey),
             targetArch, _kOSKextCacheFormatIOXML, personalities)) {
 
@@ -1816,11 +1995,14 @@ ExitStatus updateSystemPlistCaches(KextcacheArgs * toolArgs)
     }
 
 finish:
-    SAFE_RELEASE(kexts);
+    SAFE_RELEASE(unauthenticatedKexts);
+    SAFE_RELEASE(authenticKexts);
     SAFE_RELEASE(directoryValues);
     SAFE_RELEASE(personalities);
 
     OSKextSetArchitecture(startArch);
+    toolArgs->authenticationOptions.isCacheLoad = true;
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTCACHE_UPDATE_PLISTS);
 
     return result;
 }
@@ -1840,6 +2022,12 @@ ExitStatus updateDirectoryCaches(
         goto finish;
     }
 
+    /* The identifier cache is insecure, so no need to check for authentic kexts here.
+     * The bundle identifier cache is only used to speed up lookup of kexts by identifier
+     * in IOKit.  Lookups by identifier result in an OSKext object, but  any attempt
+     * to load the kext or its personalities will result in the kext being authenticated
+     * in that environment.
+     */
     if (!_OSKextWriteIdentifierCacheForKextsInDirectory(
                 kexts, folderURL, /* force? */ true)) {
         result = EX_OSERR;
@@ -2267,7 +2455,7 @@ ExitStatus filterKextsForCache(
 
     if (CFArrayGetCount(kextArray)) {
         if (earlyBoot == false) {
-            recordKextLoadListForMT(kextArray);
+            recordKextLoadListForMT(kextArray, false);
         }
     }
 
@@ -2390,7 +2578,9 @@ static Boolean isValidKextSigningTargetVolume(CFURLRef theVolRootURL)
         if (postBootPathsDict &&
             CFGetTypeID(postBootPathsDict) == CFDictionaryGetTypeID()) {
             
-            if (CFDictionaryContainsKey(postBootPathsDict, kBCKernelcacheV3Key)) {
+            if (CFDictionaryContainsKey(postBootPathsDict, kBCKernelcacheV4Key)) {
+                myResult = true;
+            } else if (CFDictionaryContainsKey(postBootPathsDict, kBCKernelcacheV3Key)) {
                 myResult = true;
             }
         }
@@ -2518,7 +2708,11 @@ static bool isSystemPLKPath(KextcacheArgs *toolArgs)
         if (postBootPathsDict &&
             CFGetTypeID(postBootPathsDict) == CFDictionaryGetTypeID()) {
             kcDict = (CFDictionaryRef)CFDictionaryGetValue(postBootPathsDict,
-                                                           kBCKernelcacheV3Key);
+                                                           kBCKernelcacheV4Key);
+            if (!kcDict) {
+                kcDict = (CFDictionaryRef)CFDictionaryGetValue(postBootPathsDict,
+                                                               kBCKernelcacheV3Key);
+            }
         }
     }
 
@@ -2603,6 +2797,31 @@ static bool isProbablyProtectedPLK(KextcacheArgs *toolArgs)
     return false;
 }
 
+static bool isProtectedAction(KextcacheArgs *toolArgs)
+{
+    Boolean targetingBootVol = false;
+
+    // isRootVolURL assumes a NULL URL implies root volume, so only assume it means
+    // targeting the boot volume when there is a real URL.
+    if (toolArgs->updateVolumeURL) {
+        targetingBootVol = isRootVolURL(toolArgs->updateVolumeURL);
+    }
+
+    return (isProbablyProtectedPLK(toolArgs) ||
+            toolArgs->updateSystemCaches ||
+            targetingBootVol);
+}
+
+static bool isSecureAuthentication(KextcacheArgs *toolArgs)
+{
+    bool sip_enabled = csr_check(CSR_ALLOW_UNRESTRICTED_FS) != 0;
+
+    return (toolArgs->authenticationOptions.performFilesystemValidation &&
+            toolArgs->authenticationOptions.performSignatureValidation &&
+            toolArgs->authenticationOptions.requireSecureLocation &&
+            toolArgs->authenticationOptions.respectSystemPolicy) || !sip_enabled;
+}
+
 /* Make sure target volume can support fast (lzvn) compression, as well as current runtime library environment */
 
 static Boolean wantsFastLibCompressionForTargetVolume(CFURLRef theVolRootURL)
@@ -2635,8 +2854,12 @@ static Boolean wantsFastLibCompressionForTargetVolume(CFURLRef theVolRootURL)
             CFGetTypeID(postBootPathsDict) == CFDictionaryGetTypeID()) {
             
             kernelCacheDict = (CFDictionaryRef)
-                CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV3Key);
-            
+                CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV4Key);
+            if (!kernelCacheDict) {
+                kernelCacheDict = (CFDictionaryRef)
+                    CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV3Key);
+            }
+
             if (kernelCacheDict &&
                 CFGetTypeID(kernelCacheDict) == CFDictionaryGetTypeID()) {
                 CFStringRef     myTempStr;      // do not release
@@ -2833,12 +3056,16 @@ createPrelinkedKernel(
     dev_t               kern_dev_t          = 0;
     bool                created_plk         = false;
     char               *plk_filename        = NULL;
+    os_signpost_id_t    spid                = generate_signpost_id();
 
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTCACHE_BUILD_PRELINKED_KERNEL);
     bzero(&prelinkFileTimes, sizeof(prelinkFileTimes));
 
     plk_filename = toolArgs->prelinkedKernelPath + strnlen(toolArgs->prelinkedKernelDirname, PATH_MAX);
     while (*plk_filename == '/') plk_filename++;
 
+    os_signpost_event_emit(get_signpost_log(), spid, SIGNPOST_EVENT_PRELINKED_KERNEL_PATH,
+                           "%s", toolArgs->prelinkedKernelPath);
     toolArgs->prelinkedKernelDir_fd = open(toolArgs->prelinkedKernelDirname,
                                            O_RDONLY | O_DIRECTORY);
     if (toolArgs->prelinkedKernelDir_fd < 0) {
@@ -2850,10 +3077,13 @@ createPrelinkedKernel(
         goto finish;
     }
 
-    /* Do not allow an untrusted kernel file if 
+    /*
+     * Do not allow an untrusted kernel file if:
      * 1) file system is restricted, and
      * 2) the prelinkedkernel we are about to replace is restricted.
-     * 18862985, 20349389, 20693294
+     *    18862985, 20349389, 20693294
+     * OR
+     * 3) we are replacing the immutable kernel
      */
     toolArgs->prelinkedKernel_fd = openat(toolArgs->prelinkedKernelDir_fd,
                                           plk_filename, O_RDONLY | O_SYMLINK);
@@ -2982,6 +3212,16 @@ createPrelinkedKernel(
             goto finish;
         }
     } else {
+        /*
+         * Allow building of non-SIP protected immutable kernel, but emit an
+         * extra warning.
+         */
+        if (toolArgs->buildImmutableKernel) {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogWarningLevel  | kOSKextLogGeneralFlag,
+                      "WARNING: building immutablekernel in a non-SIP protected path '%s'",
+                      toolArgs->prelinkedKernelPath);
+        }
         OSKextLog(/* kext */ NULL,
                   kOSKextLogDebugLevel  | kOSKextLogGeneralFlag,
                   "Creating unprotected prelinked kernel: %s",
@@ -2992,12 +3232,10 @@ createPrelinkedKernel(
     /* Try a lock on the volume for the prelinked kernel being updated.
      * The lock prevents kextd from starting up a competing kextcache.
      */
-    if (!getenv("_com_apple_kextd_skiplocks")) {
-        // xxx - updateBoots * related should return only sysexit-type values, not errno
-        result = takeVolumeForPath(toolArgs->prelinkedKernelPath);
-        if (result != EX_OK) {
-            goto finish;
-        }
+    // xxx - updateBoots * related should return only sysexit-type values, not errno
+    result = takeVolumeForPath(toolArgs->prelinkedKernelPath);
+    if (result != EX_OK) {
+        goto finish;
     }
 #endif /* !NO_BOOT_ROOT */
 
@@ -3115,7 +3353,13 @@ createPrelinkedKernel(
     if (result != EX_OK) {
         goto finish;
     }
-    
+
+    /*
+     * the PLK that we wrote at 'toolArgs->prelinkedKernelPath' is now valid,
+     * and should not be removed on subsequent errors.
+     */
+    created_plk = false;
+
     if (toolArgs->symbolDirURL) {
         result = writePrelinkedSymbols(toolArgs->symbolDirURL,
                                        generatedSymbols, generatedArchs);
@@ -3134,6 +3378,14 @@ createPrelinkedKernel(
                   "Created prelinked kernel using \"%s\"",
                   toolArgs->kernelPath);
     }
+
+    if (toolArgs->buildImmutableKernel) {
+        result = buildImmutableKernelcache(toolArgs, plk_filename);
+        if (result != EX_OK) {
+            goto finish;
+        }
+    }
+
     removeStalePrelinkedKernels(toolArgs);
 
     /*
@@ -3268,6 +3520,8 @@ finish:
     putVolumeForPath(toolArgs->prelinkedKernelPath, result);
 #endif /* !NO_BOOT_ROOT */
 
+    os_signpost_event_emit(get_signpost_log(), spid, SIGNPOST_EVENT_RESULT, "%d", result);
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTCACHE_BUILD_PRELINKED_KERNEL);
     return result;
 }
 
@@ -3644,6 +3898,132 @@ finish:
     return result;
 }
 
+
+/*********************************************************************
+ * buildImmutableKernelcache
+ *
+ * We assume that the file 'plk_filename' has been created and
+ * validated. This function will create an immutablekernel file at the
+ * same file path (toolArgs->prelinkedKernelDir_fd), then invoke the
+ * personalize_macos binary.
+ *********************************************************************/
+static ExitStatus
+buildImmutableKernelcache(KextcacheArgs *toolArgs, const char *plk_filename)
+{
+    ExitStatus result = EX_OK;
+    int dirfd = toolArgs->prelinkedKernelDir_fd;
+    bool have_backup = false;
+    char imk_filename[256] = {};
+    char imk_backupname[256] = {};
+
+    // validate toolArgs
+    if (dirfd < 0) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogGeneralFlag | kOSKextLogErrorLevel,
+                  "Prelinked kernel path \"%s\" no longer seems to be open.",
+                  toolArgs->prelinkedKernelDirname);
+        result = EX_OSERR;
+        goto finish;
+    }
+
+    if (!translatePrelinkedToImmutablePath(plk_filename, imk_filename, sizeof(imk_filename))) {
+        result = EX_OSERR;
+        goto finish;
+    }
+
+    OSKextLog(/* kext */ NULL,
+              kOSKextLogGeneralFlag | kOSKextLogBasicLevel,
+              "Rebuilding immutable kernel: \"%s/%s\"",
+              toolArgs->prelinkedKernelDirname, imk_filename);
+
+    if (strlcpy(imk_backupname, imk_filename, sizeof(imk_backupname)) > sizeof(imk_backupname) ||
+        strlcat(imk_backupname, ".bak", sizeof(imk_backupname)) > sizeof(imk_backupname)) {
+        result = EX_SOFTWARE;
+        goto finish;
+    }
+
+    // make a backup copy (hardlink) of the immutable kernel
+    // NOTE: this will overwrite any existing backup file
+    if (renameat(dirfd, imk_filename, dirfd, imk_backupname) != 0 && errno != ENOENT) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogGeneralFlag | kOSKextLogErrorLevel,
+                  "ERROR: failed to backup immutable kernel to: \"%s/%s\"",
+                  toolArgs->prelinkedKernelDirname, imk_backupname);
+        result = EX_OSERR;
+        goto finish;
+    }
+    have_backup = true;
+
+    // hard link the immutable kernel to the newly built prelinked kernel
+    if (linkat(dirfd, plk_filename, dirfd, imk_filename, 0) != 0) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogGeneralFlag | kOSKextLogErrorLevel,
+                  "ERROR: link failed: \"%s/%s\" -> \"%s/%s\"",
+                  toolArgs->prelinkedKernelDirname, imk_filename,
+                  toolArgs->prelinkedKernelDirname, plk_filename);
+        result = EX_OSERR;
+        goto finish;
+    }
+
+    // personalize the new immutable kernel
+    {
+        char root_volume[PATH_MAX] ={};
+        char imk_path[PATH_MAX] = {};
+        char *personalize_argv[] = {
+            kPersonalizeMacOSTool,
+            "--volume",
+            root_volume,     /* content to be filled in below */
+            "--kernelCache",
+            imk_path,
+            NULL
+        };
+
+        if (toolArgs->volumeRootURL) {
+            if (CFURLGetFileSystemRepresentation(toolArgs->volumeRootURL, true,
+                                                 (UInt8 *)root_volume,
+                                                 sizeof(root_volume)) == false) {
+                result = EX_SOFTWARE;
+                goto finish;
+            }
+        } else {
+            root_volume[0] = '/';
+            root_volume[1] = 0;
+        }
+
+        if (strlcpy(imk_path, toolArgs->prelinkedKernelDirname, sizeof(imk_path)) > sizeof(imk_path) ||
+            strlcat(imk_path, "/", sizeof(imk_path)) > sizeof(imk_path) ||
+            strlcat(imk_path, imk_filename, sizeof(imk_path)) > sizeof(imk_path)) {
+            result = EX_SOFTWARE;
+            goto finish;
+        }
+
+        int rval = fork_program(kPersonalizeMacOSTool, personalize_argv, true /* wait */);
+        if (rval != 0) {
+            OSKextLog(/* kext */ NULL,
+                      kOSKextLogGeneralFlag | kOSKextLogErrorLevel,
+                      "ERROR(%d): personalization failed for : \"%s/%s\"",
+                      rval, toolArgs->prelinkedKernelDirname, imk_filename);
+            result = EX_OSERR;
+            goto finish;
+        }
+    }
+
+    /* for now, we leave the immutable kernel backup file for easier recovery */
+
+finish:
+    if (have_backup && result != EX_OK) {
+        /* clean up from a failed attempt: put back the old immutable kernel */
+        renameat(dirfd, imk_backupname, dirfd, imk_filename);
+    }
+    if (result != EX_OK) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogGeneralFlag | kOSKextLogErrorLevel,
+                  "ERROR(%d): building/personalizing the immutable kernel: \"%s/%s\"",
+                  result, toolArgs->prelinkedKernelDirname, imk_filename);
+    }
+    return result;
+}
+
 #pragma mark Boot!=Root
 
 /*******************************************************************************
@@ -3740,6 +4120,13 @@ void usage(UsageLevel usageLevel)
     
     fprintf(stderr, "-%s (-%c): print this message and exit\n",
         kOptNameHelp, kOptHelp);
+
+    // print out immutable kernel building options only if the
+    // running system is able to personalize
+    if (access(kPersonalizeMacOSTool, R_OK|X_OK) == 0) {
+        fprintf(stderr, "-%s (-%c): rebuild and personalize an immutablekernel (hardlinked to the new prelinkedkernel)\n",
+                kOptNameBuildImmutable, kOptBuildImmutable);
+    }
 
     return;
 }

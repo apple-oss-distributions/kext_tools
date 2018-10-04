@@ -27,6 +27,7 @@
 #include <Security/Security.h>
 #include <sys/sysctl.h>
 #include <sys/csr.h>
+#include <syslog.h>
 #include <servers/bootstrap.h>
 #include <IOKit/kext/kextmanager_types.h>
 
@@ -62,30 +63,23 @@ static void         copySigningInfo(CFURLRef kextURL,
 static CFArrayRef   copySubjectCNArray(CFURLRef kextURL);
 static CFStringRef  copyTeamID(SecCertificateRef certificate);
 static CFStringRef  createArchitectureList(OSKextRef aKext, CFBooleanRef *isFat);
-static void         filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList);
+static void         filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boolean userLoad);
 static Boolean      hashIsInExceptionList(CFURLRef theKextURL, CFDictionaryRef theDict, CFDictionaryRef codesignAttributes);
 static uint64_t     getKextDevModeFlags(void);
-
-const static AuthOptions_t sDefaultAuthOptions = {
-    .allowNetwork = true,                   // do revocation checks
-    .isCacheLoad = false,                   // not a cache load
-    .performFilesystemValidation = true,    // validate file owner & permissions
-    .performSignatureValidation = true,     // enforce signature policy
-    .requireSecureLocation = true,          // require all kexts in a secure location
-    .respectSystemPolicy = true,            // consult system policy daemon
-};
 
 Boolean
 authenticateKext(OSKextRef theKext, void *context)
 {
     Boolean result = false;
     OSStatus sigResult = 0;
-    const AuthOptions_t *authOptions = NULL;
-
-    if (context) {
-        authOptions = (const AuthOptions_t*)context;
-    } else {
-        authOptions = &sDefaultAuthOptions;
+    const AuthOptions_t *authOptions = (const AuthOptions_t*)context;
+    if (authOptions == NULL) {
+        OSKextLogCFString(NULL,
+                          kOSKextLogErrorLevel | kOSKextLogValidationFlag,
+                          CFSTR("Kext rejected due to invalid authentication params: %@"),
+                          theKext);
+        result = false;
+        goto finish;
     }
 
     if (OSKextIsInExcludeList(theKext, true)) {
@@ -1021,12 +1015,42 @@ finish:
 }
 
 /*******************************************************************************
+ * Helper to check a personality matches
+ *******************************************************************************/
+
+ typedef struct {
+     CFMutableArrayRef personalities;
+ } __OSKextPersonalityBundleIdentifierContext;
+
+ static void __OSKextPersonalityBundleIdentifierApplierFunction(
+     const void * vKey,
+     const void * vValue,
+           void * vContext)
+{
+    CFStringRef            personalityName     = (CFStringRef)vKey;
+    CFMutableDictionaryRef personality         = (CFMutableDictionaryRef)vValue;
+    __OSKextPersonalityBundleIdentifierContext  * context =
+     (__OSKextPersonalityBundleIdentifierContext *)vContext;
+    CFMutableArrayRef      personalities       = context->personalities;
+    io_service_t           match;
+
+    if (!personalities) return;
+
+    CFRetain(personality);
+    match = IOServiceGetMatchingService(kIOMasterPortDefault, personality);
+    if (MACH_PORT_NULL != match) {
+        IOObjectRelease(match);
+        CFArrayAppendValue(personalities, personalityName);
+    }
+}
+
+/*******************************************************************************
  * filterKextLoadForMT() - check that the kext is of interest, and place kext
  * information in the kext list
  *  <rdar://problem/12435992> 
  *******************************************************************************/
 
-static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList)
+static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boolean userLoad)
 {
     if (aKext == NULL || kextList == NULL)
         return;
@@ -1034,30 +1058,28 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList)
     CFStringRef     versionString;                // do not release
     CFStringRef     bundleIDString;               // do not release
     CFStringRef     kextSigningCategory = NULL;   // do not release
+    CFDateRef       timestamp           = NULL;   // do not release
     CFBooleanRef    isFat               = kCFBooleanFalse; // do not release
     CFBooleanRef    isSigned            = kCFBooleanFalse; // do not release
-    
     CFURLRef        kextURL             = NULL;   // must release
+    CFURLRef        kextExecURL         = NULL;   // must release
     CFStringRef     kextPath            = NULL;   // must release
+    CFStringRef     kextExecPath        = NULL;   // must release
     CFStringRef     filename            = NULL;   // must release
     CFStringRef     hashString          = NULL;   // must release
     CFStringRef     archString          = NULL;   // must release
     CFStringRef     teamId              = NULL;   // must release
     CFStringRef     subjectCN           = NULL;   // must release
     CFStringRef     issuerCN            = NULL;   // must release
-    
-    SecStaticCodeRef        code        = NULL;   // must release
-    CFDictionaryRef         information = NULL;   // must release
-    CFMutableDictionaryRef  kextDict    = NULL;   // must release
-    
+    CFBooleanRef    codeless            = kCFBooleanFalse;
+    SecStaticCodeRef        code          = NULL;   // must release
+    CFDictionaryRef         information   = NULL;   // must release
+    CFDictionaryRef         personalities = NULL;   // must release
+    CFMutableDictionaryRef  kextDict      = NULL;   // must release
     char *          hashCString         = NULL;   // must free
-
     OSStatus status = noErr;
-    
-    /* do not message trace this if boot-args has debug set */
-    if (isDebugSetInBootargs()) {
-        return;
-    }
+
+    __OSKextPersonalityBundleIdentifierContext context = { 0 };
     
     kextURL = CFURLCopyAbsoluteURL(OSKextGetURL(aKext));
     if (!kextURL) {
@@ -1077,7 +1099,14 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList)
     filename = CFURLCopyLastPathComponent(kextURL);
     
     archString = createArchitectureList(aKext, &isFat);
-    
+
+    if (OSKextDeclaresExecutable(aKext)) {
+        kextExecURL = CFURLCopyAbsoluteURL(OSKextGetExecutableURL(aKext));
+        if (kextExecURL) kextExecPath = CFURLCopyFileSystemPath(kextExecURL, kCFURLPOSIXPathStyle);
+    } else {
+        codeless = kCFBooleanTrue;
+    }
+
     if (SecStaticCodeCreateWithPath(kextURL,
                                     kSecCSDefaultFlags,
                                     &code) != 0
@@ -1108,6 +1137,11 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList)
     else {
         CFStringRef myCFString = NULL; // do not release
         myCFString = OSKextGetIdentifier(aKext);
+
+        timestamp = CFDictionaryGetValue(information, kSecCodeInfoTimestamp);
+        if (timestamp && (CFDateGetTypeID() != CFGetTypeID(timestamp))) {
+            timestamp = NULL;
+        }
 
         /* MT functions are avoided in early boot, so the network is always available */
         status = checkKextSignature(aKext, true, true);
@@ -1194,7 +1228,21 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList)
             }
         }
     }
-        
+
+    personalities = OSKextGetValueForInfoDictionaryKey(aKext,
+        CFSTR(kIOKitPersonalitiesKey));
+    if (personalities
+        && (CFGetTypeID(personalities) == CFDictionaryGetTypeID())
+        && (CFDictionaryGetCount(personalities) > 1))
+    {
+        context.personalities = CFArrayCreateMutable(kCFAllocatorDefault,
+                                                     0,
+                                                     &kCFTypeArrayCallBacks);
+        CFDictionaryApplyFunction(personalities,
+            __OSKextPersonalityBundleIdentifierApplierFunction,
+            &context);
+    }
+
     kextDict = CFDictionaryCreateMutable(kCFAllocatorDefault,
                                          0,
                                          &kCFTypeDictionaryKeyCallBacks,
@@ -1264,13 +1312,38 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList)
                              kextPath);
     }
 
-    
-    CFArrayAppendValue(*kextList, kextDict);
+    if (kextExecPath) {
+        CFDictionaryAddValue(kextDict,
+                             CFSTR(kMessageTracerExecPathKey),
+                             kextExecPath);
+    }
+
+    if (timestamp) {
+        CFDictionaryAddValue(kextDict,
+                             CFSTR(kMessageTracerSigningTimeKey),
+                             timestamp);
+    }
+
+    CFDictionaryAddValue(kextDict, CFSTR(kMessageTracerCodelessKey), codeless);
+
+    if (userLoad) {
+        CFDictionaryAddValue(kextDict, CFSTR(kMessageTracerUserLoadKey), kCFBooleanTrue);
+    }
+
+    if (context.personalities && CFArrayGetCount(context.personalities)) {
+        CFDictionaryAddValue(kextDict,
+                             CFSTR(kMessageTracerPersonalityNamesKey),
+                             context.personalities);
+    }
+
+    CFArrayAppendValue(kextList, kextDict);
     
 finish:
     SAFE_FREE(hashCString);
     SAFE_RELEASE(kextURL);
+    SAFE_RELEASE(kextExecURL);
     SAFE_RELEASE(kextPath);
+    SAFE_RELEASE(kextExecPath);
     SAFE_RELEASE(filename);
     SAFE_RELEASE(hashString);
     SAFE_RELEASE(kextDict);
@@ -1280,6 +1353,7 @@ finish:
     SAFE_RELEASE(issuerCN);
     SAFE_RELEASE(code);
     SAFE_RELEASE(information);
+    SAFE_RELEASE(context.personalities);
     return;
 }
 
@@ -1288,7 +1362,7 @@ finish:
  *  <rdar://problem/12435992> 
  *******************************************************************************/
 void
-recordKextLoadListForMT(CFArrayRef kextList)
+recordKextLoadListForMT(CFArrayRef kextList, Boolean userLoad)
 {
     CFIndex             count, i;
     CFMutableArrayRef   kextsToMessageTrace = NULL; //must release
@@ -1301,7 +1375,7 @@ recordKextLoadListForMT(CFArrayRef kextList)
         if (kextsToMessageTrace) {
             for (i = 0; i < count; i ++) {                
                 aKext = (OSKextRef)CFArrayGetValueAtIndex(kextList, i);
-                filterKextLoadForMT(aKext, &kextsToMessageTrace);
+                filterKextLoadForMT(aKext, kextsToMessageTrace, userLoad);
             }
             if (CFArrayGetCount(kextsToMessageTrace)) {
                 postNoteAboutKextLoadsMT(CFSTR("Loaded Kext Notification"),
@@ -1316,7 +1390,7 @@ recordKextLoadListForMT(CFArrayRef kextList)
  * recordKextLoadForMT() - record the loaded kext
  *  <rdar://problem/12435992>
  *******************************************************************************/
-void recordKextLoadForMT(OSKextRef aKext)
+void recordKextLoadForMT(OSKextRef aKext, Boolean userLoad)
 {
     CFMutableArrayRef myArray = NULL; // must release
     
@@ -1328,7 +1402,7 @@ void recordKextLoadForMT(OSKextRef aKext)
                                    &kCFTypeArrayCallBacks);
     if (myArray) {
         CFArrayAppendValue(myArray, aKext);
-        recordKextLoadListForMT(myArray);
+        recordKextLoadListForMT(myArray, userLoad);
         SAFE_RELEASE(myArray);
     }
 }
@@ -1922,6 +1996,29 @@ Boolean isKextdRunning(void)
     }
     
     return( FALSE );
+}
+
+Boolean isNetBooted(void)
+{
+    Boolean isNetBooted = FALSE;
+    uint32_t isNetBootInt = 0;
+    size_t size = sizeof(isNetBootInt);
+    int error = 0;
+
+    error = sysctlbyname("kern.netboot", (void*)&isNetBootInt, &size, NULL, 0);
+    if (error != 0)
+    {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                  "Unable to read netboot sysctl: %d", error);
+        isNetBooted = FALSE;
+        goto __out;
+    }
+
+    isNetBooted = isNetBootInt != 0;
+
+__out:
+    return isNetBooted;
 }
 
 #if HAVE_DANGERZONE

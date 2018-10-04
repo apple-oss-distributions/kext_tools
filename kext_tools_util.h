@@ -14,6 +14,7 @@
 #include <mach/mach_error.h>
 
 #include <getopt.h>
+#include <os/log.h>
 #include <sysexits.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -46,6 +47,8 @@ typedef struct {
 #define kAppleInternalPath      "/AppleInternal"
 #define kDefaultDevKernelPath   "/System/Library/Kernels/kernel.development"
 #define kDefaultDevKernelSuffix ".development"
+
+#define kImmutableKernelFileName "immutablekernel"
 
 // 17 leap days from 1904 to 1970, inclusive
 #define UNIX_MAC_TIME_DELTA ((1970-1904)*365*86400 + 17*86400)
@@ -197,7 +200,9 @@ void beQuiet(void);
 
 FILE *  g_log_stream;
 // tool_openlog(), tool_log() copied to bootroot.h for libBootRoot clients
+void tool_initlog();
 void tool_openlog(const char * name);
+os_log_t get_signpost_log(void);
 void tool_log(
     OSKextRef aKext,
     OSKextLogSpec logSpec,
@@ -294,6 +299,9 @@ Boolean getKernelPathForURL(
 Boolean useDevelopmentKernel(const char * theKernelPath);
 Boolean isDebugSetInBootargs(void);
 
+// path translation from prelinkedkernel to immutablekernel
+bool translatePrelinkedToImmutablePath(const char *prelinked_path,
+                                       char *imk_path, size_t imk_len);
 
 /*********************************************************************
 * From IOKitUser/kext.subproj/OSKext.c.

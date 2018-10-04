@@ -71,7 +71,9 @@
 #include "bootcaches.h"
 #include "pgo.h"
 #include "security.h"
+#include "signposts.h"
 #include "staging.h"
+#include "kextaudit.h"
 
 /*******************************************************************************
 * Globals set from invocation arguments (xxx - could use fewer globals).
@@ -110,6 +112,8 @@ static CFRunLoopSourceRef sSignalRunLoopSource              = NULL;
 const NXArchInfo        * gKernelArchInfo                   = NULL;  // do not free
 
 ExitStatus                sKextdExitStatus                  = kKextdExitOK;
+
+static AuthOptions_t      sKextdAuthenticationOptions       = {0};
 
 /*******************************************************************************
  * Static routines.
@@ -153,12 +157,15 @@ static void LoadedKextCallback(
                                const void *object,
                                CFDictionaryRef userInfo );
 
+static void LoadLatestExcludeList(void);
+
 /*******************************************************************************
 *******************************************************************************/
 
 int main(int argc, char * const * argv)
 {
     char       logSpecBuffer[16];  // enough for a 64-bit hex value
+    os_signpost_id_t spid = 0;
 
    /*****
     * Find out what my name is.
@@ -200,11 +207,25 @@ int main(int argc, char * const * argv)
         OSKextGetLogFilter(/* kernel? */ false));
     setenv("KEXT_LOG_FILTER_USER", logSpecBuffer, /* overwrite */ 1);
 
-
-    /* Setup OSKext Authentication, using the default options.
+    /* Measure initialization time with a signpost.
      */
-    _OSKextSetAuthenticationFunction(&authenticateKext, NULL);
+    spid = generate_signpost_id();
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTD_INIT);
+
+    /* Setup OSKext authentication options, starting with networking disabled
+     * and using the boot timer to enable it shortly after boot.
+     */
+    sKextdAuthenticationOptions.allowNetwork = false;
+    sKextdAuthenticationOptions.isCacheLoad = false;
+    sKextdAuthenticationOptions.performFilesystemValidation = true;
+    sKextdAuthenticationOptions.performSignatureValidation = true;
+    sKextdAuthenticationOptions.requireSecureLocation = true;
+    sKextdAuthenticationOptions.respectSystemPolicy = true;
+    _OSKextSetAuthenticationFunction(&authenticateKext, &sKextdAuthenticationOptions);
     _OSKextSetStrictAuthentication(true);
+
+    /* Set up auditing of kext loads, see kextaudit.c */
+    _OSKextSetLoadAuditFunction(&KextAuditLoadCallback);
 
     gRepositoryURLs = OSKextGetSystemExtensionsFolderURLs();
     if (!gRepositoryURLs) {
@@ -242,6 +263,10 @@ int main(int argc, char * const * argv)
     */
     sendActiveToKernel();
 
+    // Before sending personalities and triggering matching, ensure
+    // the latest AKEL has been loaded.
+    LoadLatestExcludeList();
+
    /*****
     * Send the kext personalities to the kernel to trigger matching.
     * Now that we have UUID dependency checks, the kernel shouldn't
@@ -278,6 +303,8 @@ int main(int argc, char * const * argv)
     * bumped the busy count).
     */
     sendFinishedToKernel();
+
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTD_INIT);
 
     // Start run loop
     CFRunLoopRun();
@@ -484,7 +511,6 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
 {
     ExitStatus             result         = EX_OSERR;
     kern_return_t          kernelResult   = KERN_SUCCESS;
-    unsigned int           sourcePriority = 1;
     CFMachPortRef          kextdMachPort  = NULL;  // must release
     mach_port_limits_t     limits;  // queue limit for signal-handler port
     mach_port_t            servicePort;
@@ -522,7 +548,7 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
         servicePort, kextd_mach_port_callback, /* CFMachPortContext */ NULL,
         /* shouldFreeInfo? */ NULL);
     sClientRequestRunLoopSource = CFMachPortCreateRunLoopSource(
-        kCFAllocatorDefault, kextdMachPort, sourcePriority++);
+                                    kCFAllocatorDefault, kextdMachPort, 0);
     if (!sClientRequestRunLoopSource) {
        OSKextLog(/* kext */ NULL,
            kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
@@ -533,7 +559,7 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
         kCFRunLoopDefaultMode);
 
     // 5519500: kextd_watch_volumes now holds off on updates on its own
-    if (kextd_watch_volumes(sourcePriority++)) {
+    if (kextd_watch_volumes()) {
         goto finish;
     }
     
@@ -557,7 +583,7 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
             "Failed to set signal-handling port limits.");
     }
     sSignalRunLoopSource = CFMachPortCreateRunLoopSource(
-        kCFAllocatorDefault, sKextdSignalMachPort, sourcePriority++);
+                              kCFAllocatorDefault, sKextdSignalMachPort, 0);
     if (!sSignalRunLoopSource) {
         OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
             "Failed to create signal-handling run loop source.");
@@ -663,7 +689,7 @@ ExitStatus setUpServer(KextdArgs * toolArgs)
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 
 #ifndef NO_CFUserNotification
-    result = startMonitoringConsoleUser(toolArgs, &sourcePriority);
+    result = startMonitoringConsoleUser(toolArgs);
     if (result != EX_OK) {
         goto finish;
     }
@@ -808,9 +834,11 @@ void LoadedKextCallback(CFNotificationCenterRef center,
         myValue = CFDictionaryGetValue(userInfo, CFSTR("KextArrayKey"));
        
        if (myValue && CFGetTypeID(myValue) == CFArrayGetTypeID()) {
-           /* synchronize access to our plist file */
+           /* synchronize access to our plist file,
+              and write after 5 secs delay to catch new kernel load requests.
+            */
            CFRetain(myValue);
-           dispatch_async(dispatch_get_main_queue(), ^ {
+           dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5LL * NSEC_PER_SEC)), dispatch_get_main_queue(), ^ {
                writeKextLoadPlist(myValue);
            });
        }
@@ -853,9 +881,9 @@ finish:
 
 
 /*******************************************************************************
-* On receiving a SIGHUP or SIGTERM, the daemon sends a Mach message to the
-* signal port, causing the run loop handler function rescanExtensions() to be
-* called on the main thread.
+* On receiving a SIGHUP, the daemon sends a Mach message to the signal port,
+* causing the run loop handler function rescanExtensions() to be called on
+* the main thread.
 *
 * IMPORTANT: This is a UNIX signal handler, so no allocating or any other unsafe
 * calls. Sending a hand-rolled Mach message off the stack is okay.
@@ -1033,13 +1061,59 @@ void releaseExtensions(
     return;
 }
 
-/*******************************************************************************
-*******************************************************************************/
+void LoadLatestExcludeList()
+{
+    OSReturn ret = 0;
+    OSKextRef akelKext = NULL;
+
+    OSKextLogCFString(/* kext */ NULL,
+                      kOSKextLogBasicLevel | kOSKextLogGeneralFlag,
+                      CFSTR("Loading latest KextExcludeList."));
+
+    akelKext = OSKextGetKextWithIdentifier(CFSTR("com.apple.driver.KextExcludeList"));
+    if (!akelKext) {
+        OSKextLogCFString(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          CFSTR("Failed to find KextExcludeList."));
+        return;
+    }
+
+    if (!OSKextIsAuthentic(akelKext)) {
+        OSKextLogCFString(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          CFSTR("Failed to validate KextExcludeList."));
+        return;
+    }
+
+    ret = OSKextLoad(akelKext);
+    if (ret) {
+        OSKextLogCFString(/* kext */ NULL,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          CFSTR("Failed to load KextExcludeList: %d"), ret);
+        return;
+    }
+}
+
+void enableNetworkAuthentication(void)
+{
+    // Avoid using the network during boot - <rdar://35004679>
+    sKextdAuthenticationOptions.allowNetwork = true;
+}
+
+/*
+ * rescanExtensions() is called (via the runloop) whenever kextd gets a SIGHUP,
+ * and whenever kextd notices that it is out of date as port of check_rebuild()
+ * or plistCachesNeedRebuild in kextd_watchvol.c.
+ */
 void rescanExtensions(void)
 {
+    os_signpost_id_t spid = generate_signpost_id();
+
     OSKextLog(/* kext */ NULL,
         kOSKextLogBasicLevel | kOSKextLogGeneralFlag,
         "Rescanning kernel extensions.");
+
+    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTD_RESCAN_EXTENSIONS);
 
 #ifndef NO_CFUserNotification
     resetUserNotifications(/* dismissAlert */ false);
@@ -1047,6 +1121,10 @@ void rescanExtensions(void)
 
     releaseExtensions(/* timer */ NULL, /* context */ NULL);
     readExtensions();
+
+    // Before sending personalities and triggering matching, ensure
+    // the latest AKEL has been loaded.
+    LoadLatestExcludeList();
     
     // need to trigger check_rebuild (in watchvol.c) for mkext, etc
     // perhaps via mach message to the notification port
@@ -1061,6 +1139,8 @@ void rescanExtensions(void)
     */
     readSystemKextPropertyValues(CFSTR(kOSBundleHelperKey),
         gKernelArchInfo, /* forceUpdate? */ true, /* values */ NULL);
+
+    os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTD_RESCAN_EXTENSIONS);
 
     return;
 }

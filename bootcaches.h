@@ -60,6 +60,7 @@
 #define kBCKernelcacheV1Key         CFSTR("Kernelcache v1.1")// dict
 #define kBCKernelcacheV2Key         CFSTR("Kernelcache v1.2")// dict
 #define kBCKernelcacheV3Key         CFSTR("Kernelcache v1.3")// dict
+#define kBCKernelcacheV4Key         CFSTR("Kernelcache v1.4")// dict
 #define kBCKernelPathKey            CFSTR("KernelPath")      //   m_k | kernel
 #define kBCPreferredCompressionKey  CFSTR("Preferred Compression") // "lzvn"
 #if DEV_KERNEL_SUPPORT
@@ -200,14 +201,16 @@ int updateStamps(struct bootCaches *caches, int command);
 Boolean plistCachesNeedRebuild(const NXArchInfo * kernelArchInfo);
 Boolean check_kext_boot_cache_file(
     struct bootCaches * caches,
-    const char * cache_path,
-    const char * kernel_path);
+    const char *cache_path,
+    const char *kernel_path,
+    const char *immutable_path);
 // build the mkext; waiting for the kextcache child if instructed
 int rebuild_kext_boot_cache_file(
     struct bootCaches *caches,
     const char * cache_path,
     const char * kernel_file,
-    Boolean startup_kexts_ok);
+    Boolean startup_kexts_ok,
+    Boolean rebuild_immutable_kernel);
 
 // check/rebuild CSFDE caches
 Boolean check_csfde(struct bootCaches *caches);
