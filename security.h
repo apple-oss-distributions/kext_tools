@@ -59,6 +59,16 @@
 #define kMTKextLoadingDomain        "com.apple.libkext.kext.loading.v4"
 #define kMTKextBlockedDomain        "com.apple.libkext.kext.blocked"
 
+#define GET_CSTRING_PTR(the_cfstring, the_ptr, the_buffer, the_size) \
+do { \
+	the_ptr = CFStringGetCStringPtr(the_cfstring, kCFStringEncodingUTF8); \
+	if (the_ptr == NULL) { \
+		the_buffer[0] = 0x00; \
+		the_ptr = the_buffer;  \
+		CFStringGetCString(the_cfstring, the_buffer, the_size, kCFStringEncodingUTF8); \
+	} \
+} while(0)
+
 void    messageTraceExcludedKext(OSKextRef aKext);
 void    recordKextLoadListForMT(CFArrayRef kextList, Boolean userLoad);
 void    recordKextLoadForMT(OSKextRef aKext, Boolean userLoad);
@@ -66,6 +76,8 @@ void    recordKextLoadForMT(OSKextRef aKext, Boolean userLoad);
 OSStatus checkKextSignature(OSKextRef aKext,
                             Boolean checkExceptionList,
                             Boolean allowNetwork);
+Boolean checkEntitlementAtURL(CFURLRef anURL, CFStringRef entitlementString, Boolean allowNetwork);
+Boolean isAllowedToLoadThirdPartyKext(OSKextRef theKext);
 Boolean isInExceptionList(OSKextRef theKext, CFURLRef theKextURL, Boolean useCache);
 Boolean isInStrictExceptionList(OSKextRef theKext, CFURLRef theKextURL, Boolean useCache);
 Boolean isInLibraryExtensionsFolder(OSKextRef theKext);
@@ -75,6 +87,9 @@ Boolean isInvalidSignatureAllowed(void);
 Boolean isKextdRunning(void);
 int callSecKeychainMDSInstall( void );
 
+CFStringRef copyCDHashFromURL(CFURLRef anURL);
+void copySigningInfo(CFURLRef kextURL, CFStringRef* cdhash, CFStringRef* teamId,
+                        CFStringRef* subjectCN, CFStringRef* issuerCN);
 void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer, CFDictionaryRef codesignAttributes);
 
 Boolean isNetBooted(void);
@@ -87,6 +102,8 @@ typedef struct AuthOptions {
     Boolean performSignatureValidation;
     Boolean requireSecureLocation;
     Boolean respectSystemPolicy;
+    Boolean checkDextApproval;
+    Boolean is_kextcache;
 } AuthOptions_t;
 
 // context is expected to be a pointer to an AuthOptions_t structure.
