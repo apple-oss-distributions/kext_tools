@@ -249,9 +249,11 @@ static bool isBaseSystemActive(void)
     return getenv("__OSINSTALL_ENVIRONMENT") != NULL;
 }
 
-static bool isInstallerActive(void)
+static bool kextdGetOutOfMyWay(void)
 {
-    return get_bootarg("-rootdmg-ramdisk") != NULL;
+    uint32_t watchvol = 0;
+    get_bootarg_int("kextd_watchvol", &watchvol);
+    return watchvol != 1;
 }
 
 /******************************************************************************
@@ -908,8 +910,9 @@ static void vol_appeared(DADiskRef disk, void *launchCtx)
     // 7628429: ignore read-only filesystems (which might be on writable media)
     if (CFURLGetFileSystemRepresentation(volURL, false, (UInt8*)path, PATH_MAX)) {
         struct statfs sfs;
+        bool isRoot = (strcmp(path, "/") != 0);
         if (statfs(path, &sfs) == -1)       goto finish;
-        if (strcmp(path, "/") != 0 &&
+        if ((!isRoot || (isRoot && isBaseSystemActive())) &&
             sfs.f_flags & MNT_RDONLY)       goto finish;    // ignore ro, non-root
         if (sfs.f_flags & MNT_DONTBROWSE)   goto finish;    // respect nobrowse
     } else {
@@ -1512,9 +1515,9 @@ checkScheduleUpdate(struct watchedVol *watched)
 	// the installer.
 	// The OSInstaller cannot rely on kInstallCommitPath as that file lives
 	// on the data volume, and not the system volume which is being updated.
-	if (isBaseSystemActive() && isInstallerActive()) {
+	if (kextdGetOutOfMyWay()) {
 		OSKextLog(NULL, kOSKextLogDetailLevel|kOSKextLogFileAccessFlag,
-				  "%s: install environment active, ignoring changes",
+				  "%s: ignoring changes. Dynamic volume updates with boot-arg kextd_watchvol=1 only.",
 				  watched->caches->root);
 		goto finish;
 	}
@@ -1650,9 +1653,9 @@ static Boolean check_rebuild(struct watchedVol *watched)
 
     // This check is also in checkScheduleUpdate(), but _kextmanager_lock_reboot can also
     // result in a call to check_rebuild(), which we don't want in the installer.
-    if (isBaseSystemActive() && isInstallerActive()) {
+    if (kextdGetOutOfMyWay()) {
         OSKextLog(NULL, kOSKextLogDetailLevel|kOSKextLogFileAccessFlag,
-                  "%s: install environment active, ignoring changes",
+                  "%s: ignoring changes. Dynamic volume updates with boot-arg kextd_watchvol=1 only.",
                   watched->caches->root);
         goto finish;
     }

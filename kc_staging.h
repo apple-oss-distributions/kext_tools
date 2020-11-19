@@ -1,22 +1,14 @@
 //
-//  rosp_staging.h
+//  kc_staging.h
 //  kext_tools
 //
 //  Created by Jack Kim-Biggs on 7/16/19.
 //
 
-#ifndef rosp_staging_h
-#define rosp_staging_h
+#ifndef kc_staging_h
+#define kc_staging_h
 
 #define _kOSKextReadOnlyDataVolumePath "/System/Volumes/Data"
-
-#define kOSKextDeferredBootcachesInstallScriptPath "/private/var/install/shove_kernels"
-#define kOSKextDeferredBootcachesInstallScriptMode 0700
-#define kOSKextDeferredUpdateScriptContents \
-"#!/bin/sh\n" \
-"/usr/sbin/kcditto\n" \
-"exit 0"
-
 
 #ifdef KCDITTO_STANDALONE_BINARY
 #define ERROR_LOG_FUNCTION(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
@@ -39,8 +31,7 @@
 } while (0)
 #define LOG(...) LOG_FUNCTION(__VA_ARGS__)
 
-bool requiresDeferredUpdate(char *prelinkedDirPath);
-int createDeferredUpdateScript(void);
-int copyKernelsInVolume(char *volRoot);
+int copyKCsInVolume(char *volRoot);
+int copyDeferredPrelinkedKernels(char *volRoot);
 
-#endif /* rosp_staging_h */
+#endif /* kc_staging_h */
