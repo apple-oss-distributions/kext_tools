@@ -82,6 +82,8 @@
     <dict>
         <key>Version</key>
         <integer>1</integer>
+        <key>SupportsPairedRecovery</key>
+        <true/>
         <key>RestoreBundlePath</key>
         <string>./Restore</string>
         <key>BuildManifestPath</key>
@@ -127,6 +129,27 @@
             <dict>
                 <key>DestinationPath</key>
                 <string>./usr/standalone/firmware/FUD/ANE.img4</string>
+                <key>ManifestRule</key>
+                <integer>1</integer>
+            </dict>
+            <key>Ap,ANE1</key>
+            <dict>
+                <key>DestinationPath</key>
+                <string>./usr/standalone/firmware/FUD/ANE1.img4</string>
+                <key>ManifestRule</key>
+                <integer>1</integer>
+            </dict>
+            <key>Ap,ANE2</key>
+            <dict>
+                <key>DestinationPath</key>
+                <string>./usr/standalone/firmware/FUD/ANE2.img4</string>
+                <key>ManifestRule</key>
+                <integer>1</integer>
+            </dict>
+            <key>Ap,ANE3</key>
+            <dict>
+                <key>DestinationPath</key>
+                <string>./usr/standalone/firmware/FUD/ANE3.img4</string>
                 <key>ManifestRule</key>
                 <integer>1</integer>
             </dict>
@@ -267,6 +290,13 @@
             <dict>
                 <key>DestinationPath</key>
                 <string>./usr/standalone/firmware/base_system_root_hash.img4</string>
+                <key>ManifestRule</key>
+                <integer>1</integer>
+            </dict>
+            <key>MtpFirmware</key>
+            <dict>
+                <key>DestinationPath</key>
+                <string>./usr/standalone/firmware/FUD/MtpFirmware.img4</string>
                 <key>ManifestRule</key>
                 <integer>1</integer>
             </dict>
